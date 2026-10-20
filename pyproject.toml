@@ -176,6 +176,9 @@ dev = [
 disco = [
   "disco_rl @ git+https://github.com/google-deepmind/disco_rl.git@main ; python_version >= '3.11'",
 ]
+cuda = [
+    "jax[cuda12]>=0.5.3",
+]
 
 [project.urls]
 "Homepage" = "https://github.com/EdanToledo/Stoix"
