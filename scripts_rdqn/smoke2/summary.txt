@@ -1,0 +1,6 @@
+rdqn rc=139 64s
+ddqn rc=0 139s
+dqn rc=0 139s
+dueling rc=139 150s
+SMOKE2_DONE
+rdqn freeway try1 rc=0

@@ -416,10 +416,37 @@ def make_playground_env(scenario_name: str, config: DictConfig) -> Tuple[Environ
     return env, eval_env
 
 
+def make_pgx_env(scenario_name: str, config: DictConfig) -> Tuple[Environment, Environment]:
+    """Creates and wraps a PGX environment (2026-10-31; used for the 5 MinAtar games).
+    env.kwargs: sticky_action_prob (default 0.1, MinAtar original), max_episode_steps (episode cap; the cap is
+    reported as the end of an episode and, like every Stoix off-policy system here, timestep.last() is treated as
+    termination in training)."""
+    import pgx
+    from stoa.env_adapters.pgx import PGXToStoa
+
+    kw = dict(copy.deepcopy(config.env.kwargs))
+    max_steps = int(kw.pop("max_episode_steps", 10000))
+    sticky = float(kw.pop("sticky_action_prob", 0.1))
+
+    def _one():
+        e = pgx.make(scenario_name)
+        if hasattr(e, "sticky_action_prob"):
+            e.sticky_action_prob = sticky
+        e = PGXToStoa(e)
+        e = EpisodeStepLimitWrapper(e, max_steps)
+        return NoExtrasWrapper(e)
+
+    env, eval_env = _one(), _one()
+    env, eval_env = apply_optional_wrappers((env, eval_env), config)
+    env = apply_core_wrappers(env, config)
+    return env, eval_env
+
+
 # A dispatcher mapping environment suite names to their respective maker functions.
 ENV_MAKERS = {
     "jumanji": make_jumanji_env,
     "gymnax": make_gymnax_env,
+    "pgx": make_pgx_env,
     "brax": make_brax_env,
     "craftax": make_craftax_env,
     "jaxarc": make_jaxarc_env,

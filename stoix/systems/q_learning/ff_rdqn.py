@@ -1,0 +1,646 @@
+"""DQN / RDQN with an optional CRN counterfactual branch (Anakin, single file).  2026-10-30.
+
+Built on stoix/systems/q_learning/ff_dqn.py; with  system.rdqn=False  system.crn=False  it is the same algorithm
+(same key splits, same buffer, same loss value 0.5*mean(delta^2)), checked by scripts in the run notes.
+
+Value   Q~(s,a) = q_theta(s,a) + c                         (c: one scalar; c = 0 and never updated for DQN)
+Target  y = r + gamma (1 - d) ( max_b q_target(s', b) + c_target )
+        u = y - q_theta(s, a)                               (residual without the online scalar)
+Network (Adam, the stoix optimiser chain incl. grad clipping)
+  DQN   L_q = 0.5 mean (u - sg[c])^2                        (= stoix q_learning l2 loss when c = 0)
+  RDQN  L_q = 0.5 mean (u - mean u)^2                       (centred: the scalar cancels, only the relative part)
+Scalar (separate optax.sgd, NOT Adam, NOT clipped)
+  L_c = ( mean (sg[u] - c) )^2 ,  sgd lr = c_lr / 2   ->   c <- c + c_lr * mean delta,  delta = y - q - c
+  (c_lr = 1: one Newton step, c becomes the batch mean of u; identical to relq_torch RDQNAgent.scalar_update)
+Target params (q and c together) follow the stoix Polyak update with tau.
+
+CRN (system.crn=True): at every env step a counterfactual action b ~ Uniform(A minus {a}) is executed from the SAME
+pre-step environment state.  The stoa gymnax adapter draws the step noise from a key stored in that state, so the
+real and the counterfactual step share every random draw (common random numbers); the counterfactual successor
+state is discarded.  Each buffer item holds both branches; the loss runs over the 2m transitions of a batch of m
+items (= relq_torch --cf_mode sum).  Optional pair term (system.cf_pair_coef > 0): + coef * 0.5 mean (u_a - u_b)^2.
+Env calls per real step: 2 with CRN, 1 without (logged as env_calls).
+
+n-step (system.n_step = n > 1, 2026-10-31; trajectory buffer, sequences of n consecutive steps per env):
+  G_n = sum_{i<n} g^i alive_i r_i,  Gamma_n = g^n alive_n,  alive_i = prod_{j<i} (1 - d_j)
+  y_n = G_n + Gamma_n ( max_b q-(s_n, b) + c- ),  y_1 = r_0 + g (1 - d_0) ( max_b q-(s_1, b) + c- )
+  system.c_mode:
+    same     network and scalar both use y_n  (n-step DQN / n-step RDQN; uncorrected, like Rainbow)
+    sep_cor  network uses y_1 (centred for RDQN); scalar residual
+               delta_c = (y_1 - q(s_0,a_0) - c) + sum_{i=1}^{n-1} g^i alive_i d1-_i,
+               d1-_i = r_i + g (1 - d_i)(max q-(s_{i+1}) + c-) - q-(s_i, a_i) - c-   (target net)
+             (fixed point Q*, level mode contracts by E[Gamma_n] per sync; see 01_理论/verify_nstep)
+    sep_unc  network uses y_1, scalar uses y_n  (biased: Q*_{r-kappa}, kappa >= 0; control only)
+  system.traj_buffer=True with n_step=1 runs the 1-step algorithm through the trajectory buffer (protocol check).
+
+Reset-continuing (system.reset_continuing=True, 2026-10-31): every termination (incl. time limits) becomes a
+transition to the auto-reset state with the normal discount; done is stored as 0.  The optimal policy of this
+continuing MDP equals the episodic optimum for reward r - kappa*, kappa* = (1-g) V'*(rho0) (reward-rate objective).
+Evaluation is unchanged (episodic return).
+
+Baselines (2026-10-31):
+  system.c51=True: C51 (Bellemare et al. 2017) on the MinAtar body, num_atoms / vmin / vmax, greedy by expected value,
+    categorical projection, cross-entropy; same replay / target / exploration protocol.
+  system.reward_centering=True: simple reward centering (Naik et al. 2024): target uses r - rbar,
+    rbar <- rbar + rc_beta * (mean batch reward - rbar) after every update.
+
+Per-evaluation records are appended to  <system.run_log_dir>/<name>.jsonl  (timestep, env_calls, eval/train return,
+c, q_tilde, td_std, ...).
+"""
+import copy
+import json
+import os
+import time
+from typing import Any, Callable, Dict, Tuple
+
+import chex
+import distrax
+import flashbax as fbx
+import flax
+import flax.linen as nn
+import hydra
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+from colorama import Fore, Style
+from flashbax.buffers.trajectory_buffer import BufferState
+from omegaconf import DictConfig, OmegaConf
+from stoa import Environment, TimeStep, WrapperState, get_final_step_metrics
+from typing_extensions import NamedTuple
+
+from stoix.base_types import (
+    AnakinExperimentOutput,
+    LearnerFn,
+    OffPolicyLearnerState,
+    OnlineAndTarget,
+)
+from stoix.evaluator import evaluator_setup, get_distribution_act_fn
+from stoix.networks.base import FeedForwardActor as Actor
+from stoix.systems.q_learning.dqn_types import Transition
+from stoix.utils import make_env as environments
+from stoix.utils.jax_utils import unreplicate_batch_dim
+from stoix.utils.logger import LogEvent, StoixLogger
+from stoix.utils.total_timestep_checker import check_total_timesteps
+from stoix.utils.training import make_learning_rate
+
+
+class MinAtarTorso(nn.Module):
+    """Standard MinAtar network body (Young & Tian 2019): Conv(16, 3x3, stride 1, VALID) -> ReLU -> flatten ->
+    Dense(128) -> ReLU.  Input (B, 10, 10, C) channel-last (gymnax layout, no flatten wrapper)."""
+    channels: int = 16
+    hidden: int = 128
+    layer_norm: bool = False      # PQN: LayerNorm before each ReLU (no extra params when False)
+
+    @nn.compact
+    def __call__(self, x: chex.Array) -> chex.Array:
+        x = x.astype(jnp.float32)
+        x = nn.Conv(self.channels, (3, 3), (1, 1), padding="VALID")(x)
+        x = nn.relu(nn.LayerNorm()(x) if self.layer_norm else x)
+        x = x.reshape(*x.shape[:-3], -1)
+        x = nn.Dense(self.hidden)(x)
+        return nn.relu(nn.LayerNorm()(x) if self.layer_norm else x)
+
+
+class MinAtarC51(nn.Module):
+    """C51 on the MinAtar body: MinAtarTorso -> Dense(A * num_atoms) logits (2026-10-31)."""
+    num_actions: int
+    num_atoms: int
+
+    @nn.compact
+    def __call__(self, x):
+        h = MinAtarTorso()(x)
+        return nn.Dense(self.num_actions * self.num_atoms)(h).reshape(h.shape[:-1] + (self.num_actions, self.num_atoms))
+
+
+class _NetOut(NamedTuple):
+    preferences: chex.Array
+    logits: chex.Array
+
+
+def c51_project(probs_t, rew, d_t, support):
+    """Categorical projection of r + d_t * z onto the fixed support (Bellemare et al. 2017).
+    probs_t [B, N], rew/d_t [B], support [N] -> target probs [B, N]."""
+    vmin, vmax = support[0], support[-1]
+    dz = support[1] - support[0]
+    tz = jnp.clip(rew[:, None] + d_t[:, None] * support[None, :], vmin, vmax)
+    b = (tz - vmin) / dz                                                     # [B, N] fractional index
+    j = jnp.arange(support.shape[0], dtype=jnp.float32)
+    w = jnp.clip(1.0 - jnp.abs(b[:, :, None] - j[None, None, :]), 0.0, 1.0)  # [B, N(src), N(dst)]
+    return jnp.einsum("bi,bij->bj", probs_t, w)
+
+
+class CFTransition(NamedTuple):
+    obs: chex.ArrayTree
+    action: chex.Array
+    reward: chex.Array
+    done: chex.Array
+    next_obs: chex.Array
+    info: Dict
+    cf_action: chex.Array
+    cf_reward: chex.Array
+    cf_done: chex.Array
+    cf_next_obs: chex.Array
+
+
+def make_step_fn(env: Environment, q_apply: Callable, config: DictConfig) -> Callable:
+    """One environment step (+ the CRN counterfactual step).  Same key usage as ff_dqn when crn=False."""
+    crn = bool(config.system.crn)
+    reset_cont = bool(config.system.get("reset_continuing", False))
+    assert not (crn and reset_cont), "reset_continuing with CRN not supported"
+    A = int(config.system.action_dim)
+    decay = float(config.system.get("eps_decay_steps", 0))     # 0: fixed eps of the action head (stoix default)
+    e0, e1 = float(config.system.get("eps_start", 1.0)), float(config.system.get("eps_end", 0.1))
+
+    def step(params: Any, env_state: WrapperState, last_timestep: TimeStep, key: chex.PRNGKey, t=None):
+        key, policy_key = jax.random.split(key)
+        actor_policy = q_apply(params, last_timestep.observation)
+        if decay > 0:                                           # linear eps_start -> eps_end over decay env steps
+            eps = e1 + (e0 - e1) * jnp.clip(1.0 - t.astype(jnp.float32) / decay, 0.0, 1.0)
+            actor_policy = distrax.EpsilonGreedy(preferences=actor_policy.preferences, epsilon=eps)
+        action = actor_policy.sample(seed=policy_key)
+        new_env_state, timestep = env.step(env_state, action)
+        done = timestep.last().reshape(-1)
+        info = timestep.extras["episode_metrics"]
+        next_obs = timestep.extras["next_obs"]
+        if reset_cont:
+            # termination -> transition to the reset state (continuing MDP): never mask the bootstrap, and the
+            # successor is the auto-reset observation (stoa AutoResetWrapper puts it in timestep.observation).
+            done = jnp.zeros_like(done)
+            next_obs = timestep.observation
+        if not crn:
+            tr = Transition(last_timestep.observation, action, timestep.reward, done, next_obs, info)
+            return new_env_state, timestep, key, tr
+        key, cf_key = jax.random.split(key)
+        b = jax.random.randint(cf_key, action.shape, 0, A - 1)
+        b = (b + (b >= action)).astype(action.dtype)              # b ~ Uniform(A minus {a})
+        _, cf_ts = env.step(env_state, b)                         # SAME pre-step state -> same noise; discarded
+        tr = CFTransition(
+            last_timestep.observation, action, timestep.reward, done, next_obs, info,
+            b, cf_ts.reward, cf_ts.last().reshape(-1), cf_ts.extras["next_obs"],
+        )
+        return new_env_state, timestep, key, tr
+
+    return step
+
+
+def get_warmup_fn(env, q_params, q_apply, buffer_add_fn, config) -> Callable:
+    step = make_step_fn(env, q_apply, config)
+
+    def warmup(env_states, timesteps, buffer_states, keys):
+        def _env_step(carry, _):
+            env_state, last_timestep, key = carry
+            env_state, timestep, key, tr = step(q_params.online, env_state, last_timestep, key, jnp.int32(0))
+            return (env_state, timestep, key), tr
+
+        (env_states, timesteps, keys), traj_batch = jax.lax.scan(
+            _env_step, (env_states, timesteps, keys), None, config.system.warmup_steps
+        )
+        buffer_states = buffer_add_fn(buffer_states, traj_batch)
+        return env_states, timesteps, keys, buffer_states
+
+    return jax.vmap(warmup, in_axes=(0, 0, 0, 0), out_axes=(0, 0, 0, 0), axis_name="batch")
+
+
+def nstep_loss(p: Dict, tp: Dict, tr: Any, net_apply: Callable, gamma: float, n_step: int, c_mode: str,
+               rdqn: bool, double: bool, max_abs_reward: float):
+    """n-step / separated-horizon loss (module level so tests can call it).  Returns (loss, info)."""
+    B = tr.action.shape[0]
+    ar = jnp.arange(B)
+    r = jnp.clip(tr.reward, -max_abs_reward, max_abs_reward).astype(jnp.float32)
+    d = tr.done.astype(jnp.float32)                                   # [B, n]
+    alive = jnp.cumprod(jnp.concatenate([jnp.ones((B, 1)), 1.0 - d[:, :-1]], axis=1), axis=1)
+    disc = gamma ** jnp.arange(n_step, dtype=jnp.float32)
+    G = jnp.sum(disc * alive * r, axis=1)
+    Gam = (gamma ** n_step) * alive[:, -1] * (1.0 - d[:, -1])
+
+    def vmax(nobs):
+        qt = net_apply(tp["q"], nobs).preferences
+        if double:
+            a_star = jnp.argmax(jax.lax.stop_gradient(net_apply(p["q"], nobs).preferences), axis=-1)
+            return qt[jnp.arange(qt.shape[0]), a_star]
+        return jnp.max(qt, axis=-1)
+
+    obs0 = jax.tree_util.tree_map(lambda x: x[:, 0], tr.obs)
+    q_tm1 = net_apply(p["q"], obs0).preferences
+    qa = q_tm1[ar, tr.action[:, 0]]
+    c, cm = p["c"], tp["c"]
+    y_n = jax.lax.stop_gradient(G + Gam * (vmax(jax.tree_util.tree_map(lambda x: x[:, -1], tr.next_obs)) + cm))
+    if c_mode == "same":
+        y_net = y_n
+    else:
+        v1 = vmax(jax.tree_util.tree_map(lambda x: x[:, 0], tr.next_obs))
+        y_net = jax.lax.stop_gradient(r[:, 0] + gamma * (1.0 - d[:, 0]) * (v1 + cm))
+    u = y_net - qa
+    if rdqn:
+        net_loss = 0.5 * jnp.mean(jnp.square(u - jnp.mean(u)))
+    else:
+        net_loss = 0.5 * jnp.mean(jnp.square(u - jax.lax.stop_gradient(c)))
+    qa_sg = jax.lax.stop_gradient(qa)
+    if c_mode == "sep_cor":
+        corr = jnp.zeros((B,), jnp.float32)
+        if n_step > 1:
+            flat = lambda x: x[:, 1:].reshape((B * (n_step - 1),) + x.shape[2:])   # noqa: E731
+            o_i = jax.tree_util.tree_map(flat, tr.obs)
+            no_i = jax.tree_util.tree_map(flat, tr.next_obs)
+            a_i = tr.action[:, 1:].reshape(-1)
+            qti = net_apply(tp["q"], o_i).preferences[jnp.arange(a_i.shape[0]), a_i]
+            vni = jnp.max(net_apply(tp["q"], no_i).preferences, axis=-1)
+            r_i, d_i = r[:, 1:].reshape(-1), d[:, 1:].reshape(-1)
+            d1 = (r_i + gamma * (1.0 - d_i) * (vni + cm) - qti - cm).reshape(B, n_step - 1)
+            corr = jnp.sum((disc * alive)[:, 1:] * d1, axis=1)
+        delta_sg = jax.lax.stop_gradient(y_net - qa_sg + corr) - c
+    else:                                                         # same / sep_unc: scalar uses y_n
+        delta_sg = jax.lax.stop_gradient(y_n - qa_sg) - c
+    c_loss = jnp.square(jnp.mean(delta_sg))
+    info = {
+        "q_loss": net_loss,
+        "mean_delta": jnp.mean(delta_sg),
+        "td_std": jnp.std(jax.lax.stop_gradient(u) - c),
+        "mean_u_net": jnp.mean(jax.lax.stop_gradient(u) - c),
+        "q_tilde_mean": jnp.mean(qa) + c,
+        "q_mean": jnp.mean(qa),
+        "c": c,
+        "term_frac": jnp.mean(d[:, 0]),
+        "gamma_n_mean": jnp.mean(Gam),
+    }
+    return net_loss + c_loss, info
+
+
+def get_learner_fn(env, q_apply, net_apply, update_fns, buffer_fns, config) -> LearnerFn[OffPolicyLearnerState]:
+    buffer_add_fn, buffer_sample_fn = buffer_fns
+    q_update_fn, c_update_fn = update_fns
+    step = make_step_fn(env, q_apply, config)
+    rdqn, crn = bool(config.system.rdqn), bool(config.system.crn)
+    pair_coef = float(config.system.cf_pair_coef)
+    gamma = float(config.system.gamma)
+    double = bool(config.system.get("double", False))
+    target_period = int(config.system.get("target_period", 0))   # >0: hard copy every N gradient updates
+    rdqn_a = bool(config.system.get("rdqn_a", False))           # RDQN-A: closed-form anchor instead of learned c
+    anchor_batches = max(1, int(config.system.get("anchor_batch", 16384)) // int(config.system.batch_size))
+    anchor_omega = float(config.system.get("anchor_omega", 1.0))
+    env_steps_per_update = int(config.system.rollout_length) * int(config.arch.num_envs)
+    c51 = bool(config.system.get("c51", False))
+    reward_centering = bool(config.system.get("reward_centering", False))
+    rc_beta = float(config.system.get("rc_beta", 1e-3))
+    if c51 or reward_centering:
+        assert not crn and not rdqn and not rdqn_a, "c51 / reward centering are DQN-family baselines"
+    if c51:
+        support = jnp.linspace(float(config.system.vmin), float(config.system.vmax), int(config.system.num_atoms))
+    n_step = int(config.system.get("n_step", 1))
+    use_traj = n_step > 1 or bool(config.system.get("traj_buffer", False))
+    c_mode = str(config.system.get("c_mode", "same"))
+    assert c_mode in ("same", "sep_cor", "sep_unc")
+    if use_traj:
+        assert not crn and not rdqn_a, "n-step path: CRN / RDQN-A not supported"
+
+    def _update_step(learner_state: OffPolicyLearnerState, _: Any):
+        def _env_step(learner_state: OffPolicyLearnerState, _: Any):
+            q_params, opt_states, buffer_state, key, env_state, last_timestep = learner_state
+            env_state, timestep, key, tr = step(q_params.online, env_state, last_timestep, key, opt_states["t"])
+            return OffPolicyLearnerState(q_params, opt_states, buffer_state, key, env_state, timestep), tr
+
+        learner_state, traj_batch = jax.lax.scan(_env_step, learner_state, None, config.system.rollout_length)
+        params, opt_states, buffer_state, key, env_state, last_timestep = learner_state
+        buffer_state = buffer_add_fn(buffer_state, traj_batch)
+        opt_states = {**opt_states, "t": opt_states["t"] + env_steps_per_update}
+
+        def _loss_fn(p: Dict, tp: Dict, tr: Any, rbar=0.0):
+            if use_traj:
+                return nstep_loss(p, tp, tr, net_apply, gamma, n_step, c_mode, rdqn, double,
+                                  float(config.system.max_abs_reward))
+            if crn:
+                cat = lambda x, y: jnp.concatenate([x, y], axis=0)
+                obs, nxt = cat(tr.obs, tr.obs), cat(tr.next_obs, tr.cf_next_obs)
+                act, rew = cat(tr.action, tr.cf_action), cat(tr.reward, tr.cf_reward)
+                don = cat(tr.done, tr.cf_done)
+            else:
+                obs, nxt, act, rew, don = tr.obs, tr.next_obs, tr.action, tr.reward, tr.done
+            rew = jnp.clip(rew, -config.system.max_abs_reward, config.system.max_abs_reward).astype(jnp.float32)
+            if reward_centering:                        # simple reward centering (Naik et al. 2024): r - rbar
+                rew = rew - jax.lax.stop_gradient(rbar)
+            d_t = ((1.0 - don.astype(jnp.float32)) * gamma).astype(jnp.float32)
+            if c51:
+                B = act.shape[0]; ar = jnp.arange(B)
+                out_tm1 = net_apply(p["q"], obs)
+                out_t = net_apply(tp["q"], nxt)
+                if double:
+                    a_star = jnp.argmax(jax.lax.stop_gradient(net_apply(p["q"], nxt).preferences), axis=-1)
+                else:
+                    a_star = jnp.argmax(out_t.preferences, axis=-1)
+                probs_t = jax.nn.softmax(out_t.logits[ar, a_star], axis=-1)
+                target = jax.lax.stop_gradient(c51_project(probs_t, rew, d_t, support))
+                logp = jax.nn.log_softmax(out_tm1.logits[ar, act], axis=-1)
+                loss = -jnp.mean(jnp.sum(target * logp, axis=-1))
+                qa = out_tm1.preferences[ar, act]
+                y_mean = rew + d_t * out_t.preferences[ar, a_star]
+                info = {"q_loss": loss, "mean_delta": jnp.mean(y_mean - qa), "td_std": jnp.std(y_mean - qa),
+                        "q_tilde_mean": jnp.mean(qa), "q_mean": jnp.mean(qa), "c": p["c"],
+                        "term_frac": jnp.mean(don.astype(jnp.float32)),
+                        "mass_at_edges": jnp.mean(target[:, 0] + target[:, -1])}
+                return loss + 0.0 * p["c"], info
+            q_tm1 = net_apply(p["q"], obs).preferences
+            q_t = net_apply(tp["q"], nxt).preferences
+            if double:                                  # Double DQN: online net selects, target net evaluates
+                a_star = jnp.argmax(jax.lax.stop_gradient(net_apply(p["q"], nxt).preferences), axis=-1)
+                v_t = q_t[jnp.arange(q_t.shape[0]), a_star]
+            else:
+                v_t = jnp.max(q_t, axis=-1)
+            y = jax.lax.stop_gradient(rew + d_t * (v_t + tp["c"]))
+            qa = q_tm1[jnp.arange(act.shape[0]), act]
+            u = y - qa
+            c = p["c"]
+            if rdqn:
+                net_loss = 0.5 * jnp.mean(jnp.square(u - jnp.mean(u)))
+            else:
+                net_loss = 0.5 * jnp.mean(jnp.square(u - jax.lax.stop_gradient(c)))
+            if crn and pair_coef > 0.0:
+                m = act.shape[0] // 2
+                net_loss = net_loss + pair_coef * 0.5 * jnp.mean(jnp.square(u[:m] - u[m:]))
+            delta_sg = jax.lax.stop_gradient(u) - c
+            c_loss = jnp.square(jnp.mean(delta_sg))
+            info = {
+                "q_loss": net_loss,
+                "mean_delta": jnp.mean(delta_sg),
+                "td_std": jnp.std(delta_sg),
+                "q_tilde_mean": jnp.mean(qa) + c,
+                "q_mean": jnp.mean(qa),
+                "c": c,
+                "term_frac": jnp.mean(don.astype(jnp.float32)),
+            }
+            if reward_centering:
+                info["rbar"] = rbar
+            return net_loss + c_loss, info
+
+        def _update_epoch(update_state: Tuple, _: Any) -> Tuple:
+            params, opt_states, buffer_state, key = update_state
+            key, sample_key = jax.random.split(key)
+            transitions = buffer_sample_fn(buffer_state, sample_key).experience
+            rbar = opt_states["rbar"]
+            grads, loss_info = jax.grad(_loss_fn, has_aux=True)(params.online, params.target, transitions, rbar)
+            grads, loss_info = jax.lax.pmean((grads, loss_info), axis_name="batch")
+            grads, loss_info = jax.lax.pmean((grads, loss_info), axis_name="device")
+            q_upd, q_opt = q_update_fn(grads["q"], opt_states["q"])
+            c_upd, c_opt = c_update_fn(grads["c"], opt_states["c"])
+            new_online = {"q": optax.apply_updates(params.online["q"], q_upd),
+                          "c": optax.apply_updates(params.online["c"], c_upd)}
+            n = opt_states["n"] + 1
+            if target_period > 0:                       # hard sync of q and c every target_period updates
+                sync = (n % target_period) == 0
+                new_target = jax.tree_util.tree_map(lambda o, t_: jnp.where(sync, o, t_), new_online, params.target)
+            else:
+                sync = jnp.array(False)
+                new_target = optax.incremental_update(new_online, params.target, config.system.tau)
+            if rdqn_a:
+                # RDQN-A (paper Alg. 2): at the first update and after every target sync
+                #   c- <- (1-omega) c- + omega * sum_j h_j / sum_j v_j  over anchor_batches x batch replay samples,
+                #   h_j = r_j + g(1-d_j) max_b q-(s'_j,b) - q-(s_j,a_j),  v_j = 1 - g(1-d_j)   (target network q-).
+                # No learnable scalar (c_lr must be 0); the online level is c- (online c is set to the same value).
+                key, a_key = jax.random.split(key)
+
+                def _anchor(tq):
+                    def body(carry, k):
+                        b = buffer_sample_fn(buffer_state, k).experience
+                        d = b.done.astype(jnp.float32)
+                        r = jnp.clip(b.reward, -config.system.max_abs_reward,
+                                     config.system.max_abs_reward).astype(jnp.float32)
+                        qs = net_apply(tq, b.obs).preferences
+                        qn = net_apply(tq, b.next_obs).preferences
+                        h = r + gamma * (1.0 - d) * jnp.max(qn, -1) - qs[jnp.arange(b.action.shape[0]), b.action]
+                        v = 1.0 - gamma * (1.0 - d)
+                        return (carry[0] + jnp.sum(h), carry[1] + jnp.sum(v)), None
+                    (H, V), _ = jax.lax.scan(body, (0.0, 0.0), jax.random.split(a_key, anchor_batches))
+                    return H / V
+
+                do = jnp.logical_or(n == 1, sync)
+                c_new = jax.lax.cond(do, lambda: (1.0 - anchor_omega) * new_target["c"]
+                                     + anchor_omega * _anchor(new_target["q"]), lambda: new_target["c"])
+                new_target = {"q": new_target["q"], "c": c_new}
+                new_online = {"q": new_online["q"], "c": c_new}
+            if reward_centering:                        # rbar <- rbar + beta (mean batch reward - rbar)
+                r_mean = jnp.mean(jnp.clip(transitions.reward, -config.system.max_abs_reward,
+                                           config.system.max_abs_reward).astype(jnp.float32))
+                r_mean = jax.lax.pmean(jax.lax.pmean(r_mean, axis_name="batch"), axis_name="device")
+                rbar = rbar + rc_beta * (r_mean - rbar)
+            new_opt = {"q": q_opt, "c": c_opt, "t": opt_states["t"], "n": n, "rbar": rbar}
+            return (OnlineAndTarget(new_online, new_target), new_opt, buffer_state, key), loss_info
+
+        update_state, loss_info = jax.lax.scan(_update_epoch, (params, opt_states, buffer_state, key), None,
+                                               config.system.epochs)
+        params, opt_states, buffer_state, key = update_state
+        learner_state = OffPolicyLearnerState(params, opt_states, buffer_state, key, env_state, last_timestep)
+        # mean reward per real env step of this rollout (output only; no effect on training or keys)
+        loss_info = {**loss_info, "rollout_reward_per_step": jnp.full((config.system.epochs,),
+                                                                  jnp.mean(traj_batch.reward.astype(jnp.float32)))}
+        return learner_state, (traj_batch.info, loss_info)
+
+    def learner_fn(learner_state: OffPolicyLearnerState) -> AnakinExperimentOutput[OffPolicyLearnerState]:
+        batched_update_step = jax.vmap(_update_step, in_axes=(0, None), axis_name="batch")
+        learner_state, (episode_info, loss_info) = jax.lax.scan(
+            batched_update_step, learner_state, None, config.arch.num_updates_per_eval
+        )
+        return AnakinExperimentOutput(learner_state=learner_state, episode_metrics=episode_info,
+                                      train_metrics=loss_info)
+
+    return learner_fn
+
+
+def learner_setup(env: Environment, keys: chex.Array, config: DictConfig):
+    n_devices = len(jax.devices())
+    action_dim = int(env.action_space().num_values)
+    config.system.action_dim = action_dim
+    key, q_net_key = keys
+
+    c51 = bool(config.system.get("c51", False))
+    if c51:
+        c51_net = MinAtarC51(num_actions=action_dim, num_atoms=int(config.system.num_atoms))
+        _support = jnp.linspace(float(config.system.vmin), float(config.system.vmax), int(config.system.num_atoms))
+
+        def _c51_apply(pq, o):
+            lg = c51_net.apply(pq, o)
+            return _NetOut(preferences=jnp.sum(jax.nn.softmax(lg, -1) * _support, -1), logits=lg)
+
+        class _C51Wrap:
+            def __init__(self, eps):
+                self.eps = eps
+
+            def init(self, k, x):
+                return c51_net.init(k, x)
+
+            def apply(self, pq, o):
+                return distrax.EpsilonGreedy(preferences=_c51_apply(pq, o).preferences, epsilon=self.eps)
+
+        q_network = _C51Wrap(config.system.training_epsilon)
+        eval_q_network = _C51Wrap(config.system.evaluation_epsilon)
+        net_apply_fn = _c51_apply
+    else:
+        torso = hydra.utils.instantiate(config.network.actor_network.pre_torso)
+        head = hydra.utils.instantiate(config.network.actor_network.action_head, action_dim=action_dim,
+                                       epsilon=config.system.training_epsilon)
+        q_network = Actor(torso=torso, action_head=head)
+        eval_head = hydra.utils.instantiate(config.network.actor_network.action_head, action_dim=action_dim,
+                                            epsilon=config.system.evaluation_epsilon)
+        eval_q_network = Actor(torso=torso, action_head=eval_head)
+        net_apply_fn = q_network.apply
+
+    q_lr = make_learning_rate(config.system.q_lr, config, config.system.epochs)
+    q_optim = optax.chain(optax.clip_by_global_norm(config.system.max_grad_norm), optax.adam(q_lr, eps=1e-5))
+    c_optim = optax.sgd(float(config.system.c_lr) / 2.0)        # scalar: plain SGD, separate from Adam
+
+    init_x = env.observation_space().generate_value()
+    init_x = jax.tree_util.tree_map(lambda x: x[None, ...], init_x)
+    q_online = q_network.init(q_net_key, init_x)
+    online = {"q": q_online, "c": jnp.zeros((), jnp.float32)}
+    params = OnlineAndTarget(online, online)
+    opt_states = {"q": q_optim.init(online["q"]), "c": c_optim.init(online["c"]),
+                  "t": jnp.int32(int(config.system.warmup_steps) * int(config.arch.num_envs)),   # env steps (eps)
+                  "n": jnp.int32(0),                                                            # grad updates
+                  "rbar": jnp.float32(0.0)}                                                     # reward centering
+
+    q_apply = lambda p, o: q_network.apply(p["q"], o)               # noqa: E731  (policy ignores c)
+    eval_apply = lambda p, o: eval_q_network.apply(p["q"], o)       # noqa: E731
+
+    dummy = dict(
+        obs=jax.tree_util.tree_map(lambda x: x.squeeze(0), init_x),
+        action=jnp.zeros((), dtype=int), reward=jnp.zeros((), dtype=float), done=jnp.zeros((), dtype=bool),
+        next_obs=jax.tree_util.tree_map(lambda x: x.squeeze(0), init_x),
+        info={"episode_return": 0.0, "episode_length": 0, "is_terminal_step": False},
+    )
+    if config.system.crn:
+        dummy_transition = CFTransition(**dummy, cf_action=jnp.zeros((), dtype=int),
+                                        cf_reward=jnp.zeros((), dtype=float), cf_done=jnp.zeros((), dtype=bool),
+                                        cf_next_obs=jax.tree_util.tree_map(lambda x: x.squeeze(0), init_x))
+    else:
+        dummy_transition = Transition(**dummy)
+    config.system.buffer_size = config.system.total_buffer_size // (n_devices * config.arch.update_batch_size)
+    config.system.batch_size = config.system.total_batch_size // (n_devices * config.arch.update_batch_size)
+    n_step = int(config.system.get("n_step", 1))
+    if n_step > 1 or bool(config.system.get("traj_buffer", False)):
+        buffer_fn = fbx.make_trajectory_buffer(add_batch_size=config.arch.num_envs,
+                                               sample_batch_size=config.system.batch_size,
+                                               sample_sequence_length=n_step, period=1,
+                                               min_length_time_axis=max(n_step, 1),
+                                               max_size=config.system.buffer_size)
+        _raw_add = buffer_fn.add
+        buffer_add = lambda st, x: _raw_add(st, jax.tree_util.tree_map(lambda y: jnp.swapaxes(y, 0, 1), x))  # noqa
+    else:
+        buffer_fn = fbx.make_item_buffer(max_length=config.system.buffer_size, min_length=config.system.batch_size,
+                                         sample_batch_size=config.system.batch_size, add_batches=True,
+                                         add_sequences=True)
+        buffer_add = buffer_fn.add
+    buffer_states = buffer_fn.init(dummy_transition)
+
+    learn = get_learner_fn(env, q_apply, net_apply_fn, (q_optim.update, c_optim.update),
+                           (buffer_add, buffer_fn.sample), config)
+    learn = jax.pmap(learn, axis_name="device")
+    warmup = get_warmup_fn(env, params, q_apply, buffer_add, config)
+    warmup = jax.pmap(warmup, axis_name="device")
+
+    key, *env_keys = jax.random.split(key, n_devices * config.arch.update_batch_size * config.arch.num_envs + 1)
+    env_states, timesteps = env.reset(jnp.stack(env_keys))
+    reshape_states = lambda x: x.reshape(  # noqa: E731
+        (n_devices, config.arch.update_batch_size, config.arch.num_envs) + x.shape[1:])
+    env_states = jax.tree_util.tree_map(reshape_states, env_states)
+    timesteps = jax.tree_util.tree_map(reshape_states, timesteps)
+
+    key, step_key, warmup_key = jax.random.split(key, num=3)
+    step_keys = jax.random.split(step_key, n_devices * config.arch.update_batch_size)
+    warmup_keys = jax.random.split(warmup_key, n_devices * config.arch.update_batch_size)
+    reshape_keys = lambda x: x.reshape((n_devices, config.arch.update_batch_size) + x.shape[1:])  # noqa: E731
+    step_keys, warmup_keys = reshape_keys(jnp.stack(step_keys)), reshape_keys(jnp.stack(warmup_keys))
+
+    replicate_learner = (params, opt_states, buffer_states)
+    broadcast = lambda x: jnp.broadcast_to(x, (config.arch.update_batch_size,) + x.shape)  # noqa: E731
+    replicate_learner = jax.tree_util.tree_map(broadcast, replicate_learner)
+    replicate_learner = flax.jax_utils.replicate(replicate_learner, devices=jax.devices())
+    params, opt_states, buffer_states = replicate_learner
+    env_states, timesteps, keys, buffer_states = warmup(env_states, timesteps, buffer_states, warmup_keys)
+    init_learner_state = OffPolicyLearnerState(params, opt_states, buffer_states, step_keys, env_states, timesteps)
+    return learn, eval_apply, init_learner_state
+
+
+def _mean(x) -> float:
+    return float(np.mean(np.asarray(x)))
+
+
+def run_experiment(_config: DictConfig) -> float:
+    config = copy.deepcopy(_config)
+    n_devices = len(jax.devices())
+    config.num_devices = n_devices
+    config = check_total_timesteps(config)
+    assert config.arch.num_updates >= config.arch.num_evaluation
+
+    env, eval_env = environments.make(config=config)
+    key, key_e, q_net_key = jax.random.split(jax.random.PRNGKey(config.arch.seed), num=3)
+    learn, eval_apply, learner_state = learner_setup(env, (key, q_net_key), config)
+    evaluator, absolute_metric_evaluator, (trained_params, eval_keys) = evaluator_setup(
+        eval_env=eval_env, key_e=key_e, eval_act_fn=get_distribution_act_fn(config, eval_apply),
+        params=learner_state.params.online, config=config,
+    )
+    config.arch.num_updates_per_eval = config.arch.num_updates // config.arch.num_evaluation
+    steps_per_rollout = (n_devices * config.arch.num_updates_per_eval * config.system.rollout_length
+                         * config.arch.update_batch_size * config.arch.num_envs)
+    calls_per_step = 2 if config.system.crn else 1
+
+    logger = StoixLogger(config)
+    logger.log_config(OmegaConf.to_container(config, resolve=True))
+    os.makedirs(config.system.run_log_dir, exist_ok=True)
+    algo = ("rdqn" if config.system.rdqn else "dqn") + ("_crn" if config.system.crn else "")
+    if config.system.crn and float(config.system.cf_pair_coef) > 0:
+        algo += f"_pair{config.system.cf_pair_coef}"
+    if config.system.get("algo_name"):
+        algo = str(config.system.algo_name)
+    log_path = os.path.join(config.system.run_log_dir,
+                            f"{config.env.scenario.task_name}_{algo}_s{config.arch.seed}.jsonl")
+    flog = open(log_path, "w")
+    flog.write(json.dumps({"config": OmegaConf.to_container(config, resolve=True)}) + "\n")
+    print(f"{Fore.YELLOW}{Style.BRIGHT}{algo}  log -> {log_path}  devices {jax.devices()}{Style.RESET_ALL}")
+
+    t0 = time.time()
+    for eval_step in range(config.arch.num_evaluation):
+        start_time = time.time()
+        learner_output = learn(learner_state)
+        jax.block_until_ready(learner_output)
+        elapsed = time.time() - start_time
+        t = int(steps_per_rollout * (eval_step + 1))
+        episode_metrics, ep_completed = get_final_step_metrics(learner_output.episode_metrics)
+        tm = {k: _mean(v) for k, v in learner_output.train_metrics.items()}
+        rec = {"timestep": t, "env_calls": t * calls_per_step, "sps": steps_per_rollout / elapsed}
+        if ep_completed:
+            rec["train_return"] = _mean(episode_metrics["episode_return"])
+            rec["train_length"] = _mean(episode_metrics["episode_length"])
+        rec.update(tm)
+        logger.log({"timestep": t}, t, eval_step, LogEvent.MISC)
+        if ep_completed:
+            episode_metrics["steps_per_second"] = steps_per_rollout / elapsed
+            logger.log(episode_metrics, t, eval_step, LogEvent.ACT)
+        logger.log(dict(learner_output.train_metrics), t, eval_step, LogEvent.TRAIN)
+
+        trained_params = unreplicate_batch_dim(learner_output.learner_state.params.online)
+        key_e, *eval_keys = jax.random.split(key_e, n_devices + 1)
+        eval_keys = jnp.stack(eval_keys).reshape(n_devices, -1)
+        evaluator_output = evaluator(trained_params, eval_keys)
+        jax.block_until_ready(evaluator_output)
+        rec["eval_return"] = _mean(evaluator_output.episode_metrics["episode_return"])
+        rec["eval_length"] = _mean(evaluator_output.episode_metrics["episode_length"])
+        rec["wall"] = time.time() - t0
+        logger.log(evaluator_output.episode_metrics, t, eval_step, LogEvent.EVAL)
+        flog.write(json.dumps(rec) + "\n"); flog.flush()
+        learner_state = learner_output.learner_state
+
+    flog.write(json.dumps({"done": True, "wall": time.time() - t0}) + "\n")
+    flog.close()
+    logger.stop()
+    return float(rec["eval_return"])
+
+
+@hydra.main(config_path="../../configs/default/anakin", config_name="default_ff_rdqn.yaml", version_base="1.2")
+def hydra_entry_point(cfg: DictConfig) -> float:
+    OmegaConf.set_struct(cfg, False)
+    perf = run_experiment(cfg)
+    print(f"{Fore.CYAN}{Style.BRIGHT}RDQN/DQN(+CRN) experiment completed{Style.RESET_ALL}")
+    return perf
+
+
+if __name__ == "__main__":
+    hydra_entry_point()

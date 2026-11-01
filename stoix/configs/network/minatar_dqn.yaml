@@ -1,0 +1,6 @@
+# ---MinAtar standard Q network (Young & Tian 2019): conv16 3x3 VALID -> FC128 -> linear Q head---
+actor_network:
+  pre_torso:
+    _target_: stoix.systems.q_learning.ff_rdqn.MinAtarTorso
+  action_head:
+    _target_: stoix.networks.heads.DiscreteQNetworkHead

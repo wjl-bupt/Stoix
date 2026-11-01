@@ -1,0 +1,14 @@
+# ---Environment Configs (pgx MinAtar, 2026-10-31)---
+env_name: pgx
+
+scenario:
+  name: minatar-asterix
+  task_name: asterix
+
+kwargs:
+  sticky_action_prob: 0.1
+  max_episode_steps: 10000
+
+eval_metric: episode_return
+
+wrapper: null

@@ -1,0 +1,7 @@
+# ---MinAtar body with LayerNorm (for PQN), 2026-10-31---
+actor_network:
+  pre_torso:
+    _target_: stoix.systems.q_learning.ff_rdqn.MinAtarTorso
+    layer_norm: True
+  action_head:
+    _target_: stoix.networks.heads.DiscreteQNetworkHead

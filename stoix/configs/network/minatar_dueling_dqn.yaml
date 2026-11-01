@@ -1,0 +1,8 @@
+# ---MinAtar torso + dueling head (Wang et al. 2016): V(s) + A(s,a) - mean_a A, both linear on the 128 features---
+actor_network:
+  pre_torso:
+    _target_: stoix.systems.q_learning.ff_rdqn.MinAtarTorso
+  action_head:
+    _target_: stoix.networks.dueling.DuelingQNetwork
+    layer_sizes: []
+    activation: relu

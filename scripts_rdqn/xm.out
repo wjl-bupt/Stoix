@@ -1,0 +1,5 @@
+autotune0 rc=0 121s  
+/home/junweiluo/Stoix/scripts_rdqn/xm.sh: line 5: 171265 Segmentation fault      timeout 400 env "$@" .venv/bin/python stoix/systems/q_learning/ff_dqn.py $O > scripts_rdqn/xm_$tag.log 2>&1
+cmdbuf_off rc=139 55s  
+both_off rc=0 123s  
+XM_DONE
