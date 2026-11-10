@@ -1,0 +1,9 @@
+# ---Environment Configs---
+env_name: mujoco_playground
+
+scenario:
+  name: CartpoleSwingup
+  task_name: CartpoleSwingup
+
+kwargs: {}
+eval_metric: episode_return

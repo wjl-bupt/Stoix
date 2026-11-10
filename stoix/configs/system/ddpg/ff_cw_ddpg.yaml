@@ -1,0 +1,33 @@
+# --- CW-DDPG (cw_continuous.py) --- base hyperparameters = Stoix ff_ddpg.yaml
+system_name: ff_cw_ddpg
+rollout_length: 1
+epochs: 1
+warmup_steps: 32
+total_buffer_size: 500_000
+total_batch_size: 256
+actor_lr: 3e-4
+q_lr: 3e-4
+tau: 0.005
+gamma: 0.99
+max_grad_norm: 0.5
+decay_learning_rates: False
+max_abs_reward: 20_000
+exploration_noise: 0.15
+# --- Relative-Q critic (cw_continuous.py) ---
+head: duel             # q (plain critic = the base algorithm) | pair (CW-Pair) | duel (CW-Duel)
+pairing: rho           # rho: same-trajectory groups + cross-group pairs | random: i.i.d. batch
+pair_rho: 0.5          # weight of the cross-trajectory part (rho kernel)
+st_group: 8            # slots per same-trajectory group (1 uniform anchor + st_group-1 partners)
+n_partners: 7          # pair head: cross-group partners per slot (rho) / cyclic shifts (random)
+torso: [256, 256]      # pair / duel state torso
+enc: [256, 256]        # pair head: (s,a) encoder
+pair_hidden: [256]     # pair head: g([e_x, e_y])
+f_hidden: [256, 256]   # duel head: f(s,a)
+pair_rank: 32          # duel head: rank of the antisymmetric part of W
+q_hidden: [256, 256, 256, 256]   # head=q critic (same size as Stoix mlp_ddpg)
+layer_norm: False
+truncation_bootstrap: True       # done = TRUE termination only; time-limit truncation is bootstrapped
+algo_name: ""
+run_log_dir: /home/junweiluo/stoix_runs/cw_continuous
+activation: silu       # critic MLP activation (silu | relu)
+warmup_random: False   # True: uniform random actions during warmup (TD3 / CleanRL)

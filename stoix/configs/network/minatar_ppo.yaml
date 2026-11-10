@@ -1,0 +1,12 @@
+# ---MinAtar actor-critic (2026-11-01): separate MinAtar bodies (conv16 3x3 VALID -> FC128) for actor and critic---
+actor_network:
+  pre_torso:
+    _target_: stoix.systems.q_learning.ff_rdqn.MinAtarTorso
+  action_head:
+    _target_: stoix.networks.heads.CategoricalHead
+
+critic_network:
+  pre_torso:
+    _target_: stoix.systems.q_learning.ff_rdqn.MinAtarTorso
+  critic_head:
+    _target_: stoix.networks.heads.ScalarCriticHead

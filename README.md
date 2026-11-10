@@ -1,3 +1,5 @@
+> **rdqn 分支（relative-Q / CW-Q-ρ 项目）：实验入口与说明见 [cwq/README.md](cwq/README.md)，2026-11-10 之前的脚本归档见 [archive/README.md](archive/README.md)。**
+
 <p align="center">
     <a href="docs/images/stoix.png">
         <img src="docs/images/stoix.png" alt="Stoix logo" width="30%"/>

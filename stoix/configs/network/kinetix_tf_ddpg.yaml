@@ -1,0 +1,16 @@
+# 2026-11-08 Kinetix off-policy networks: official-size transformer encoder + 5x128 MLP (Kinetix Table 7 FC size/depth).
+# The critic is built inside cw_continuous.py (system.obs_encoder=kinetix_tf -> EntityQCritic with the same encoder).
+actor_network:
+  pre_torso:
+    _target_: stoix.networks.base.chained_torsos
+    _recursive_: false
+    torso_cfgs:
+      - _target_: stoix.networks.specialised.kinetix_tf.KinetixTransformerEncoder
+      - _target_: stoix.networks.torso.MLPTorso
+        layer_sizes: [128, 128, 128, 128, 128]
+        use_layer_norm: False
+        activation: relu
+  action_head:
+    _target_: stoix.networks.heads.DeterministicHead
+  post_processor:
+    _target_: stoix.networks.postprocessors.ScalePostProcessor

@@ -1,0 +1,7 @@
+# 2026-11-08  source in launchers.  gpu_busy_on <gpu>: mark busy (flag owned by this shell's $BASHPID) and wait until the
+# manager's holder on that GPU is gone.  gpu_busy_off <gpu>: drop the flag (manager re-holds when no flag is left).
+GB=/home/junweiluo/gpu_busy; mkdir -p $GB
+gpu_busy_on() { local g=$1; touch $GB/busy_${g}_$BASHPID
+  for i in $(seq 1 60); do local p=$(cat $GB/holder_$g.pid 2>/dev/null)
+    if [ -n "$p" ] && kill -0 $p 2>/dev/null; then kill -9 $p; sleep 2; else [ $i -gt 3 ] && break; sleep 1; fi; done; }
+gpu_busy_off() { rm -f $GB/busy_${1}_$BASHPID; }

@@ -1,0 +1,604 @@
+"""Continuous-action Relative-Q: CW-Pair and CW-Duel critics on a DDPG or TD3 base (2026-11-04).
+
+Entry points (one file per base, all logic here):  stoix/systems/ddpg/ff_cw_ddpg.py, stoix/systems/ddpg/ff_cw_td3.py
+  system.head = q     plain Q critic = the base algorithm itself (baseline; same pipeline, same truncation handling)
+              = pair  CW-Pair: free pair head D(x, y), x = (s, a)
+              = duel  CW-Duel: D((s,a),(t,b)) = W(s,t) + A(s,a) - A(t,b)
+              = qcw   CW-Q (2026-11-04): D(x, y) = Q(x) - Q(y) with the plain unary critic Q(s,a); all-pairs /
+                      rho weight matrix as duel; TD3 next value min_k Q_k^-(s',a~); actor = TD3 actor. No scalar c.
+  system.pairing = rho     same-trajectory groups + cross-group pairs, weight (1-rho) / rho  (system.pair_rho, st_group)
+                 = random  i.i.d. batch: pair head K cyclic shifts, duel head all off-diagonal pairs (uniform)
+
+Networks (flat observation vector s, action a in [a_min, a_max]^n; all hidden layers silu):
+  QCritic     Q(s,a) = Dense1(MLP(q_hidden)([s, a]))
+  PairCritic  h = MLP(torso)(s);  e(s,a) = MLP(enc)([h, a]);  D(x,y) = Dense1(MLP(pair_hidden)([e_x, e_y]))
+  DuelCritic  h = MLP(torso)(s);  W(s,t) = w(s) - w(t) + z1(s).z2(t) - z2(s).z1(t)   (antisymmetric, rank r)
+              f(s,a) = Dense1(MLP(f_hidden)([h, a]));  A(s,a) = f(s,a) - f(s, a_ref(s)),  a_ref(s) = mu^-(s)
+              (target actor, no noise, no gradient) -> A(s, mu^-(s)) = 0: the continuous analogue of the max-centred
+              advantage of the discrete Dueling/CW-Duel stream; the state value is carried by W.
+
+Bootstrap (target networks; a~_x = mu^-(s'_x) (+ clipped Gaussian noise for TD3, target policy smoothing)):
+  M = D^-((s'_x,a~_x),(s'_y,a~_y)),  Amax = D^-((s'_x,a~_x), y),  Bmin = D^-(x, (s'_y,a~_y))
+  current-state parts (the y in Amax, the x in Bmin) from the TARGET critic (the online-sg variant diverged, 11-02).
+  Cross-weighted residual (same formula as the discrete CW-Pair, ff_rpair.py), G = g(1-d), v = 1-G, k = (1-g)/g:
+    xi = v_y r_x - v_x r_y + kG_xG_y M + G_x(v_y - kG_y) Amax + G_y(v_x - kG_x) Bmin + (-v_y - G_y(v_x - kG_x)) D(x,y)
+  target T = sg[D + xi/(1-g)],  critic loss 0.5 sum_pairs w (T - D)^2   (sum w = 1).
+  d = TRUE termination only (system.truncation_bootstrap=True): time-limit truncation is bootstrapped (DMC ends every
+  episode by truncation at 1000 steps).  Trajectory boundaries for same-trajectory pairing use the episode-end flag
+  (info.is_terminal_step, termination OR truncation).
+
+Actor (deterministic, tanh-scaled; maximise the critic's read-out of the actor action):
+  q    : -mean Q_1(s, mu(s))
+  pair : -sum_pairs w D_1((s_x, mu(s_x)), sg[y])      (anchor read-out on the training pairs, x role)
+  duel : -mean f_1(s, mu(s))                          (= -mean A_1(s, mu(s)) up to an actor-independent term)
+
+TD3 (base='td3'): twin critics, target policy smoothing (policy_noise, noise_clip), delayed actor update
+(policy_frequency, via optax.conditionally_mask as in Stoix ff_td3).  Clipped double estimate:
+  q    : min_k Q_k^-(s', a~)                                            (standard)
+  pair : both critics regress to min_k T_k(x,y)      (pessimistic in the x role, which is the role the actor reads)
+  duel : the next-state advantage A^-(s',a~) is min_k A_k^-(s',a~) inside each critic's own target (W_k own);
+         a min over the whole antisymmetric pair target would cancel between (i,j) and (j,i).
+DDPG (base='ddpg'): one critic, no smoothing, actor every step.
+"""
+import copy
+import json
+import os
+import time
+from typing import Any, Callable, Dict, Tuple
+
+import chex
+import flashbax as fbx
+import flax
+import flax.linen as nn
+import hydra
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+import rlax
+from colorama import Fore, Style
+from omegaconf import DictConfig, OmegaConf
+from stoa import get_final_step_metrics
+
+from stoix.base_types import OffPolicyLearnerState, OnlineAndTarget, AnakinExperimentOutput
+from stoix.evaluator import evaluator_setup, get_distribution_act_fn
+from stoix.networks.base import CompositeNetwork
+from stoix.networks.base import FeedForwardActor as Actor
+from stoix.networks.postprocessors import tanh_to_spec
+from stoix.systems.ddpg.ddpg_types import DDPGOptStates, DDPGParams
+from stoix.systems.q_learning.dqn_types import Transition
+from stoix.systems.q_learning.same_traj import same_traj_batch, rho_pairs, rho_weight_matrix
+from stoix.utils import make_env as environments
+from stoix.utils.jax_utils import unreplicate_batch_dim
+from stoix.utils.total_timestep_checker import check_total_timesteps
+from stoix.utils.training import make_learning_rate
+
+
+# ------------------------------------------------------------------ networks
+ACT = {"fn": nn.silu}   # set by build_system from system.activation (silu | relu)
+
+
+class MLP(nn.Module):
+    sizes: Tuple[int, ...]
+    layer_norm: bool = False
+
+    @nn.compact
+    def __call__(self, x):
+        for s in self.sizes:
+            x = nn.Dense(s)(x)
+            if self.layer_norm:
+                x = nn.LayerNorm()(x)
+            x = ACT["fn"](x)
+        return x
+
+
+class QCritic(nn.Module):
+    hidden: Tuple[int, ...] = (256, 256, 256, 256)
+    layer_norm: bool = False
+
+    @nn.compact
+    def __call__(self, obs, act):
+        return nn.Dense(1)(MLP(self.hidden, self.layer_norm)(jnp.concatenate([obs, act], -1)))[..., 0]
+
+
+class PairCritic(nn.Module):
+    torso: Tuple[int, ...] = (256, 256)
+    enc: Tuple[int, ...] = (256, 256)
+    pair_hidden: Tuple[int, ...] = (256,)
+    layer_norm: bool = False
+
+    def setup(self):
+        self.phi_net = MLP(self.torso, self.layer_norm)
+        self.enc_net = MLP(self.enc, self.layer_norm)
+        self.g_net = MLP(self.pair_hidden, self.layer_norm)
+        self.g_out = nn.Dense(1)
+
+    def encode(self, obs, act):
+        return self.enc_net(jnp.concatenate([self.phi_net(obs), act], -1))
+
+    def D(self, ex, ey):
+        return self.g_out(self.g_net(jnp.concatenate([ex, ey], -1)))[..., 0]
+
+    def __call__(self, obs, act):
+        e = self.encode(obs, act)
+        return self.D(e, e)
+
+
+class DuelCritic(nn.Module):
+    torso: Tuple[int, ...] = (256, 256)
+    f_hidden: Tuple[int, ...] = (256, 256)
+    rank: int = 32
+    layer_norm: bool = False
+
+    def setup(self):
+        self.phi_net = MLP(self.torso, self.layer_norm)
+        self.w_out = nn.Dense(1)
+        self.z1 = nn.Dense(self.rank, use_bias=False)
+        self.z2 = nn.Dense(self.rank, use_bias=False)
+        self.f_net = MLP(self.f_hidden, self.layer_norm)
+        self.f_out = nn.Dense(1)
+
+    def state(self, obs):
+        h = self.phi_net(obs)
+        return h, self.w_out(h)[..., 0], self.z1(h), self.z2(h)
+
+    def f(self, h, act):
+        return self.f_out(self.f_net(jnp.concatenate([h, act], -1)))[..., 0]
+
+    def __call__(self, obs, act):
+        h, w, z1, z2 = self.state(obs)
+        return w + self.f(h, act) + jnp.sum(z1 * z2, -1)
+
+
+def wmat(c1, c2):
+    """W(s_i, t_j) for all i, j from duel state components c = (h, w, z1, z2)."""
+    _, w1, z11, z21 = c1
+    _, w2, z12, z22 = c2
+    return w1[:, None] - w2[None, :] + z11 @ z22.T - z21 @ z12.T
+
+
+def cross_xi(D_sg, M, Amax, Bmin, rx, ry, dx, dy, gamma):
+    """Cross-weighted pair residual (identical to ff_rpair term=cross).  All arguments broadcast together."""
+    k = (1.0 - gamma) / gamma
+    Gx, Gy = gamma * (1.0 - dx), gamma * (1.0 - dy)
+    vx, vy = 1.0 - Gx, 1.0 - Gy
+    W1 = k * Gx * Gy
+    W2 = Gx * (vy - k * Gy)
+    W3 = Gy * (vx - k * Gx)
+    W4 = -vy - Gy * (vx - k * Gx)
+    return vy * rx - vx * ry + W1 * M + W2 * Amax + W3 * Bmin + W4 * D_sg
+
+
+# ------------------------------------------------------------------ critic losses
+def make_critic_fns(net, head: str, gamma: float, n_critics: int):
+    """Returns critic_loss(qp, tqp, tr, a_ref, a_n, a_n_ref, pairs) -> (loss, info) and actor_value(...)."""
+
+    def pair_T(p, tp, tr, a_n, ix, iy):
+        e_on = net.apply(p, tr.obs, tr.action, method=PairCritic.encode)
+        e_t = net.apply(tp, tr.obs, tr.action, method=PairCritic.encode)
+        e_n = net.apply(tp, tr.next_obs, a_n, method=PairCritic.encode)
+        D = net.apply(p, e_on[ix], e_on[iy], method=PairCritic.D)
+        M = net.apply(tp, e_n[ix], e_n[iy], method=PairCritic.D)
+        Amax = net.apply(tp, e_n[ix], e_t[iy], method=PairCritic.D)
+        Bmin = net.apply(tp, e_t[ix], e_n[iy], method=PairCritic.D)
+        xi = cross_xi(jax.lax.stop_gradient(D), M, Amax, Bmin, tr.r[ix], tr.r[iy], tr.d[ix], tr.d[iy], gamma)
+        return D, jax.lax.stop_gradient(D + xi / (1.0 - gamma))
+
+    def duel_parts(p, tp, tr, a_ref, a_n, a_n_ref):
+        c_on = net.apply(p, tr.obs, method=DuelCritic.state)
+        A_on = net.apply(p, c_on[0], tr.action, method=DuelCritic.f) - net.apply(p, c_on[0], a_ref, method=DuelCritic.f)
+        c_t = net.apply(tp, tr.obs, method=DuelCritic.state)
+        A_t = net.apply(tp, c_t[0], tr.action, method=DuelCritic.f) - net.apply(tp, c_t[0], a_ref, method=DuelCritic.f)
+        c_n = net.apply(tp, tr.next_obs, method=DuelCritic.state)
+        A_n = net.apply(tp, c_n[0], a_n, method=DuelCritic.f) - net.apply(tp, c_n[0], a_n_ref, method=DuelCritic.f)
+        return c_on, A_on, c_t, A_t, c_n, A_n
+
+    def duel_T(parts, A_n):
+        c_on, A_on, c_t, A_t, c_n, _ = parts
+        D = wmat(c_on, c_on) + A_on[:, None] - A_on[None, :]
+        M = wmat(c_n, c_n) + A_n[:, None] - A_n[None, :]
+        Amx = wmat(c_n, c_t) + A_n[:, None] - A_t[None, :]
+        Bmn = wmat(c_t, c_n) + A_t[:, None] - A_n[None, :]
+        return D, M, Amx, Bmn
+
+    def critic_loss(qp: Dict, tqp: Dict, tr, a_ref, a_n, a_n_ref, pairs):
+        keys = [f"c{k}" for k in range(n_critics)]
+        info = {}
+        if head == "q":
+            q_n = jnp.stack([net.apply(tqp[c], tr.next_obs, a_n) for c in keys])
+            y = jax.lax.stop_gradient(tr.r + gamma * (1.0 - tr.d) * jnp.min(q_n, 0))
+            loss = 0.0
+            for c in keys:
+                q = net.apply(qp[c], tr.obs, tr.action)
+                loss = loss + 0.5 * jnp.mean(jnp.square(y - q))
+            info.update({"q_mean": jnp.mean(q), "td_std": jnp.std(y - q)})
+            return loss, info
+        if head == "pair":
+            ix, iy, w = pairs
+            DT = [pair_T(qp[c], tqp[c], tr, a_n, ix, iy) for c in keys]
+            T = DT[0][1] if n_critics == 1 else jnp.minimum(DT[0][1], DT[1][1])
+            loss = sum(0.5 * jnp.sum(w * jnp.square(T - D)) for D, _ in DT)
+            D0 = DT[0][0]
+            info.update({"D_abs": jnp.sum(w * jnp.abs(D0)), "td_std": jnp.sqrt(jnp.sum(w * jnp.square(T - D0)))})
+            return loss, info
+        if head == "qcw":
+            W = pairs                                                     # [m, m] pair weights
+            qn = jnp.min(jnp.stack([net.apply(tqp[c], tr.next_obs, a_n) for c in keys]), 0)
+            r, d = tr.r, tr.d
+            loss = 0.0
+            for k_, c in enumerate(keys):
+                q_on = net.apply(qp[c], tr.obs, tr.action)
+                q_t = net.apply(tqp[c], tr.obs, tr.action)
+                D = q_on[:, None] - q_on[None, :]
+                M = qn[:, None] - qn[None, :]
+                Amx = qn[:, None] - q_t[None, :]
+                Bmn = q_t[:, None] - qn[None, :]
+                xi = cross_xi(jax.lax.stop_gradient(D), M, Amx, Bmn, r[:, None], r[None, :], d[:, None], d[None, :],
+                              gamma)
+                T = jax.lax.stop_gradient(D + xi / (1.0 - gamma))
+                loss = loss + 0.5 * jnp.sum(W * jnp.square(T - D))
+                if k_ == 0:
+                    u = r + gamma * (1.0 - d) * qn - q_on                     # DQN-style residual (diagnostic)
+                    info.update({"q_mean": jnp.mean(q_on), "D_abs": jnp.sum(W * jnp.abs(D)),
+                                 "td_std": jnp.sqrt(jnp.sum(W * jnp.square(T - D))),
+                                 "u_mean": jnp.mean(u), "u_std": jnp.std(u)})
+            return loss, info
+        assert head == "duel"
+        W = pairs                                                         # [m, m] pair weights
+        parts = [duel_parts(qp[c], tqp[c], tr, a_ref, a_n, a_n_ref) for c in keys]
+        A_n = parts[0][5] if n_critics == 1 else jnp.minimum(parts[0][5], parts[1][5])
+        loss = 0.0
+        for k_, c in enumerate(keys):
+            D, M, Amx, Bmn = duel_T(parts[k_], A_n)
+            r, d = tr.r, tr.d
+            xi = cross_xi(jax.lax.stop_gradient(D), M, Amx, Bmn, r[:, None], r[None, :], d[:, None], d[None, :], gamma)
+            T = jax.lax.stop_gradient(D + xi / (1.0 - gamma))
+            loss = loss + 0.5 * jnp.sum(W * jnp.square(T - D))
+            if k_ == 0:
+                info.update({"D_abs": jnp.sum(W * jnp.abs(D)), "td_std": jnp.sqrt(jnp.sum(W * jnp.square(T - D))),
+                             "adv_abs": jnp.mean(jnp.abs(parts[0][1])), "A_next_mean": jnp.mean(A_n)})
+        return loss, info
+
+    def actor_value(qp0, obs, act_mu, tr, pairs):
+        """Critic read-out maximised by the actor (critic 1, online params)."""
+        if head in ("q", "qcw"):
+            return jnp.mean(net.apply(qp0, obs, act_mu))
+        if head == "pair":
+            ix, iy, w = pairs
+            ex = net.apply(qp0, obs[ix], act_mu[ix], method=PairCritic.encode)
+            ey = jax.lax.stop_gradient(net.apply(qp0, tr.obs[iy], tr.action[iy], method=PairCritic.encode))
+            return jnp.sum(w * net.apply(qp0, ex, ey, method=PairCritic.D))
+        h = net.apply(qp0, obs, method=DuelCritic.state)[0]
+        return jnp.mean(net.apply(qp0, h, act_mu, method=DuelCritic.f))
+
+    return critic_loss, actor_value
+
+
+# ------------------------------------------------------------------ batch with float reward / done views
+@chex.dataclass(frozen=True)
+class Batch:
+    obs: chex.Array
+    action: chex.Array
+    r: chex.Array
+    d: chex.Array
+    next_obs: chex.Array
+
+
+def to_batch(tr: Transition, max_abs_reward: float) -> Batch:
+    return Batch(obs=tr.obs, action=tr.action,
+                 r=jnp.clip(tr.reward, -max_abs_reward, max_abs_reward).astype(jnp.float32),
+                 d=tr.done.astype(jnp.float32), next_obs=tr.next_obs)
+
+
+# ------------------------------------------------------------------ system
+def build_system(env, keys, config: DictConfig, base: str):
+    assert base in ("ddpg", "td3", "sac")
+    td3 = base == "td3"
+    sac = base == "sac"
+    n_devices = len(jax.devices())
+    head = str(config.system.head)
+    pairing = str(config.system.get("pairing", "rho"))
+    assert head in ("q", "pair", "duel", "qcw") and pairing in ("rho", "random")
+    action_dim = int(env.action_space().shape[-1])
+    config.system.action_dim = action_dim
+    config.system.action_minimum = float(env.action_space().minimum)
+    config.system.action_maximum = float(env.action_space().maximum)
+    a_min, a_max = config.system.action_minimum, config.system.action_maximum
+    a_scale = (a_max - a_min) / 2
+    gamma = float(config.system.gamma)
+    n_critics = 2 if (td3 or sac) else 1
+    assert not sac or head == "q", "SAC base is a baseline only (head=q)"
+    key, actor_key, q_key = keys
+
+    # actor: same construction as Stoix ff_ddpg / ff_td3
+    actor_torso = hydra.utils.instantiate(config.network.actor_network.pre_torso)
+    actor_head = hydra.utils.instantiate(config.network.actor_network.action_head, action_dim=action_dim)
+    post = hydra.utils.instantiate(config.network.actor_network.post_processor, minimum=a_min, maximum=a_max,
+                                   scale_fn=tanh_to_spec)
+    if sac:   # 11-06: stochastic tanh-Gaussian actor (Stoix SAC head)
+        from stoix.networks.heads import NormalAffineTanhDistributionHead
+        actor_network = Actor(torso=actor_torso, action_head=NormalAffineTanhDistributionHead(
+            action_dim=action_dim, minimum=a_min, maximum=a_max))
+    else:
+        actor_network = Actor(torso=actor_torso, action_head=CompositeNetwork([actor_head, post]))
+    mu = lambda p, o: actor_network.apply(p, o).mode().clip(a_min, a_max)  # noqa: E731
+
+    ln = bool(config.system.get("layer_norm", False))
+    ACT["fn"] = {"silu": nn.silu, "relu": nn.relu}[str(config.system.get("activation", "silu"))]
+    if head in ("q", "qcw"):
+        net = QCritic(hidden=tuple(config.system.q_hidden), layer_norm=ln)
+    elif head == "pair":
+        net = PairCritic(torso=tuple(config.system.torso), enc=tuple(config.system.enc),
+                         pair_hidden=tuple(config.system.pair_hidden), layer_norm=ln)
+    else:
+        net = DuelCritic(torso=tuple(config.system.torso), f_hidden=tuple(config.system.f_hidden),
+                         rank=int(config.system.pair_rank), layer_norm=ln)
+    critic_loss, actor_value = make_critic_fns(net, head, gamma, n_critics)
+
+    init_x = env.observation_space().generate_value()
+    assert not isinstance(init_x, dict), "flat observation vectors only"
+    init_x = init_x[None, ...]
+    init_a = jnp.zeros((1, action_dim))
+    actor_params = actor_network.init(actor_key, init_x)
+    q_keys = jax.random.split(q_key, n_critics)
+    q_params = {f"c{k}": net.init(q_keys[k], init_x, init_a) for k in range(n_critics)}
+    if sac:
+        q_params["log_alpha"] = jnp.log(jnp.asarray(float(config.system.get("init_alpha", 1.0)), jnp.float32))
+        target_entropy = -float(config.system.get("target_entropy_scale", 0.5)) * action_dim
+
+    actor_lr = make_learning_rate(config.system.actor_lr, config, config.system.epochs)
+    q_lr = make_learning_rate(config.system.q_lr, config, config.system.epochs)
+    actor_chain = optax.chain(optax.clip_by_global_norm(config.system.max_grad_norm), optax.adam(actor_lr, eps=1e-5))
+    if td3 and not sac:
+        actor_optim = optax.conditionally_mask(
+            actor_chain, should_transform_fn=lambda n: jnp.mod(n, config.system.policy_frequency) == 0)
+    else:
+        actor_optim = actor_chain
+    q_optim = optax.chain(optax.clip_by_global_norm(config.system.max_grad_norm), optax.adam(q_lr, eps=1e-5))
+    params = DDPGParams(OnlineAndTarget(actor_params, actor_params), OnlineAndTarget(q_params, q_params))
+    opt_states = DDPGOptStates(actor_optim.init(actor_params), q_optim.init(q_params))
+
+    trunc_boot = bool(config.system.get("truncation_bootstrap", True))
+    expl = float(config.system.exploration_noise)
+
+    def behaviour(actor_p, obs, k):
+        if sac:
+            return actor_network.apply(actor_p, obs).sample(seed=k).clip(a_min, a_max)
+        a = mu(actor_p, obs)
+        if expl != 0:
+            a = rlax.add_gaussian_noise(k, a, expl * a_scale).clip(a_min, a_max)
+        return a
+
+    warm_rand = bool(config.system.get("warmup_random", False))
+
+    def env_step(actor_p, env_state, last_ts, k, random_act=False):
+        if random_act:
+            action = jax.random.uniform(k, (last_ts.observation.shape[0], action_dim), minval=a_min, maxval=a_max)
+        else:
+            action = behaviour(actor_p, last_ts.observation, k)
+        env_state, ts = env.step(env_state, action)
+        done = (ts.terminated() if trunc_boot else ts.last()).reshape(-1)
+        nobs = ts.extras["next_obs"]
+        bad = ~(jnp.isfinite(ts.reward).reshape(-1) & jnp.all(jnp.isfinite(nobs.reshape(nobs.shape[0], -1)), -1))
+        rew = jnp.where(jnp.isfinite(ts.reward), ts.reward, 0.0)          # 11-05: physics blow-up -> terminal, r = 0
+        nobs = jnp.where(jnp.isfinite(nobs), nobs, 0.0)
+        done = jnp.logical_or(done.astype(bool), bad).astype(done.dtype)
+        tr = Transition(last_ts.observation, action, rew, done, nobs, ts.extras["episode_metrics"])
+        return env_state, ts, tr
+
+    # replay
+    dummy = Transition(obs=init_x[0], action=jnp.zeros((action_dim,), dtype=float), reward=jnp.zeros((), dtype=float),
+                       done=jnp.zeros((), dtype=bool), next_obs=init_x[0],
+                       info={"episode_return": 0.0, "episode_length": 0, "is_terminal_step": False})
+    config.system.buffer_size = config.system.total_buffer_size // (n_devices * config.arch.update_batch_size)
+    config.system.batch_size = config.system.total_batch_size // (n_devices * config.arch.update_batch_size)
+    m = int(config.system.batch_size)
+    buffer_fn = fbx.make_item_buffer(max_length=config.system.buffer_size, min_length=m, sample_batch_size=m,
+                                     add_batches=True, add_sequences=True)
+    G = int(config.system.get("st_group", 8)); rho = float(config.system.get("pair_rho", 0.5))
+    K = int(config.system.get("n_partners", 7))
+    E = int(config.arch.num_envs)
+    if head != "q" and pairing == "rho":
+        assert int(config.system.rollout_length) == 1 and m % G == 0, "rho pairing: rollout_length 1, batch % st_group"
+
+    def sample(buffer_state, k):
+        """-> (Batch, pairs, stats).  pairs: None (q), (ix, iy, w) (pair), [m, m] weights (duel)."""
+        k1, k2 = jax.random.split(k)
+        if head == "q":
+            tr = buffer_fn.sample(buffer_state, k1).experience
+            return to_batch(tr, config.system.max_abs_reward), None, {}
+        if pairing == "rho":
+            tr, ix_s, iy_s, w_s, st, idx = same_traj_batch(buffer_state, k1, m, G, E, return_idx=True,
+                                                           boundary=lambda e: e.info["is_terminal_step"])
+            if head == "pair":
+                pairs = rho_pairs(k2, idx, m // G, G, K, rho, ix_s, iy_s, w_s)
+            else:
+                pairs = rho_weight_matrix(idx, G, rho)
+            return to_batch(tr, config.system.max_abs_reward), pairs, st
+        tr = buffer_fn.sample(buffer_state, k1).experience
+        if head == "pair":
+            shift = jax.random.randint(k2, (), 1, m)
+            shifts = 1 + (shift - 1 + jnp.arange(K) * ((m - 1) // K)) % (m - 1)
+            ix = jnp.tile(jnp.arange(m), K); iy = ((jnp.arange(m)[None, :] + shifts[:, None]) % m).reshape(-1)
+            pairs = (ix, iy, jnp.full(ix.shape, 1.0 / ix.shape[0]))
+        else:
+            pairs = (1.0 - jnp.eye(m)) / (m * (m - 1))
+        return to_batch(tr, config.system.max_abs_reward), pairs, {}
+
+    NO_BV = bool(config.system.get("no_batch_vmap", False))
+    assert not NO_BV or int(config.arch.update_batch_size) == 1, "no_batch_vmap needs update_batch_size 1"
+    pmb = (lambda x: x) if NO_BV else (lambda x: jax.lax.pmean(x, "batch"))
+
+    def sac_epoch(params, opt_states, tr, kn):
+        k1, k2 = jax.random.split(kn)
+        keys_c = [f"c{k}" for k in range(n_critics)]
+        actor_on = params.actor_params.online
+
+        def q_side_loss(qp):
+            alpha = jnp.exp(qp["log_alpha"]); alpha_sg = jax.lax.stop_gradient(alpha)
+            pi_n = actor_network.apply(actor_on, tr.next_obs)
+            a_n = pi_n.sample(seed=k1); logp_n = pi_n.log_prob(a_n)
+            q_n = jnp.min(jnp.stack([net.apply(params.q_params.target[c], tr.next_obs, a_n) for c in keys_c]), 0)
+            y = jax.lax.stop_gradient(tr.r + gamma * (1.0 - tr.d) * (q_n - alpha_sg * logp_n))
+            qs = [net.apply(qp[c], tr.obs, tr.action) for c in keys_c]
+            closs = sum(0.5 * jnp.mean(jnp.square(y - q)) for q in qs)
+            pi = actor_network.apply(actor_on, tr.obs)
+            logp = jax.lax.stop_gradient(pi.log_prob(pi.sample(seed=k2)))
+            aloss = jnp.mean(alpha * jax.lax.stop_gradient(-logp - target_entropy))
+            return closs + aloss, {"q_mean": jnp.mean(qs[0]), "td_std": jnp.std(y - qs[0]), "alpha": alpha,
+                                   "alpha_loss": aloss}
+
+        def actor_loss_fn(ap):
+            alpha = jax.lax.stop_gradient(jnp.exp(params.q_params.online["log_alpha"]))
+            pi = actor_network.apply(ap, tr.obs)
+            a = pi.sample(seed=k2); logp = pi.log_prob(a)
+            q = jnp.min(jnp.stack([net.apply(params.q_params.online[c], tr.obs, a) for c in keys_c]), 0)
+            loss = jnp.mean(alpha * logp - q)
+            return loss, {"actor_loss": loss, "entropy": -jnp.mean(logp)}
+
+        a_grads, a_info = jax.grad(actor_loss_fn, has_aux=True)(actor_on)
+        q_grads, q_info = jax.grad(q_side_loss, has_aux=True)(params.q_params.online)
+        return a_grads, a_info, q_grads, q_info
+
+    def update_epoch(carry, _):
+        params, opt_states, buffer_state, key = carry
+        key, ks, kn = jax.random.split(key, 3)
+        tr, pairs, st = sample(buffer_state, ks)
+        actor_t = params.actor_params.target
+        a_ref = jax.lax.stop_gradient(mu(actor_t, tr.obs))
+        a_n_ref = jax.lax.stop_gradient(mu(actor_t, tr.next_obs))
+        if td3:
+            noise = jnp.clip(jax.random.normal(kn, a_n_ref.shape) * config.system.policy_noise,
+                             -config.system.noise_clip, config.system.noise_clip) * a_scale
+            a_n = jnp.clip(a_n_ref + noise, a_min, a_max)
+        else:
+            a_n = a_n_ref
+
+        def actor_loss_fn(ap):
+            v = actor_value(params.q_params.online["c0"], tr.obs, mu(ap, tr.obs), tr, pairs)
+            return -v, {"actor_loss": -v}
+
+        if sac:
+            a_grads, a_info, q_grads, q_info = sac_epoch(params, opt_states, tr, kn)
+        else:
+            a_grads, a_info = jax.grad(actor_loss_fn, has_aux=True)(params.actor_params.online)
+            q_grads, q_info = jax.grad(critic_loss, has_aux=True)(
+                params.q_params.online, params.q_params.target, tr, a_ref, a_n, a_n_ref, pairs)
+        a_grads, a_info = jax.lax.pmean(pmb((a_grads, a_info)), "device")
+        q_grads, q_info = jax.lax.pmean(pmb((q_grads, q_info)), "device")
+        a_upd, a_opt = actor_optim.update(a_grads, opt_states.actor_opt_state)
+        new_actor = optax.apply_updates(params.actor_params.online, a_upd)
+        q_upd, q_opt = q_optim.update(q_grads, opt_states.q_opt_state)
+        new_q = optax.apply_updates(params.q_params.online, q_upd)
+        new_actor_t, new_q_t = optax.incremental_update((new_actor, new_q), (actor_t, params.q_params.target),
+                                                        config.system.tau)
+        new_params = DDPGParams(OnlineAndTarget(new_actor, new_actor_t), OnlineAndTarget(new_q, new_q_t))
+        info = {**a_info, **q_info, **st, "term_frac": jnp.mean(tr.d)}
+        return (new_params, DDPGOptStates(a_opt, q_opt), buffer_state, key), info
+
+    def update_step(ls: OffPolicyLearnerState, _):
+        def _env(ls, _):
+            params, opt_states, buffer_state, key, env_state, last_ts = ls
+            key, k = jax.random.split(key)
+            env_state, ts, tr = env_step(params.actor_params.online, env_state, last_ts, k)
+            return OffPolicyLearnerState(params, opt_states, buffer_state, key, env_state, ts), tr
+        ls, traj = jax.lax.scan(_env, ls, None, config.system.rollout_length)
+        params, opt_states, buffer_state, key, env_state, last_ts = ls
+        buffer_state = buffer_fn.add(buffer_state, traj)
+        (params, opt_states, buffer_state, key), info = jax.lax.scan(
+            update_epoch, (params, opt_states, buffer_state, key), None, config.system.epochs)
+        return OffPolicyLearnerState(params, opt_states, buffer_state, key, env_state, last_ts), (traj.info, info)
+
+    def learner_fn(ls):
+        if NO_BV:   # 11-05: no vmap over the update-batch axis (size 1) -> env auto-reset cond stays a real cond
+            ls0 = jax.tree_util.tree_map(lambda x: x[0], ls)
+            ls0, (ep_info, loss_info) = jax.lax.scan(update_step, ls0, None, config.arch.num_updates_per_eval)
+            ls = jax.tree_util.tree_map(lambda x: x[None], ls0)
+            ep_info, loss_info = jax.tree_util.tree_map(lambda x: x[:, None], (ep_info, loss_info))
+            return AnakinExperimentOutput(learner_state=ls, episode_metrics=ep_info, train_metrics=loss_info)
+        batched = jax.vmap(update_step, in_axes=(0, None), axis_name="batch")
+        ls, (ep_info, loss_info) = jax.lax.scan(batched, ls, None, config.arch.num_updates_per_eval)
+        return AnakinExperimentOutput(learner_state=ls, episode_metrics=ep_info, train_metrics=loss_info)
+
+    def warmup(env_states, timesteps, buffer_states, keys):
+        def _env(carry, _):
+            env_state, last_ts, k = carry
+            k, kk = jax.random.split(k)
+            env_state, ts, tr = env_step(params.actor_params.online, env_state, last_ts, kk, warm_rand)
+            return (env_state, ts, k), tr
+        (env_states, timesteps, keys), traj = jax.lax.scan(_env, (env_states, timesteps, keys), None,
+                                                           config.system.warmup_steps)
+        return env_states, timesteps, keys, buffer_fn.add(buffer_states, traj)
+
+    learn = jax.pmap(learner_fn, axis_name="device")
+    warmup = jax.pmap(jax.vmap(warmup, in_axes=(0, 0, 0, 0), out_axes=(0, 0, 0, 0), axis_name="batch"),
+                      axis_name="device")
+
+    key, *env_keys = jax.random.split(key, n_devices * config.arch.update_batch_size * config.arch.num_envs + 1)
+    env_states, timesteps = env.reset(jnp.stack(env_keys))
+    rs = lambda x: x.reshape((n_devices, config.arch.update_batch_size, config.arch.num_envs) + x.shape[1:])  # noqa
+    env_states = jax.tree_util.tree_map(rs, env_states); timesteps = jax.tree_util.tree_map(rs, timesteps)
+    key, step_key, warm_key = jax.random.split(key, 3)
+    rk = lambda x: x.reshape((n_devices, config.arch.update_batch_size) + x.shape[1:])  # noqa: E731
+    step_keys = rk(jax.random.split(step_key, n_devices * config.arch.update_batch_size))
+    warm_keys = rk(jax.random.split(warm_key, n_devices * config.arch.update_batch_size))
+    rep = (params, opt_states, buffer_fn.init(dummy))
+    rep = jax.tree_util.tree_map(lambda x: jnp.broadcast_to(x, (config.arch.update_batch_size,) + x.shape), rep)
+    params_r, opt_r, buf_r = flax.jax_utils.replicate(rep, devices=jax.devices())
+    env_states, timesteps, step_keys_w, buf_r = warmup(env_states, timesteps, buf_r, warm_keys)
+    ls = OffPolicyLearnerState(params_r, opt_r, buf_r, step_keys, env_states, timesteps)
+    n_params = sum(int(np.prod(x.shape)) for x in jax.tree_util.tree_leaves(q_params))
+    return learn, actor_network, ls, n_params
+
+
+def _mean(x):
+    return float(np.mean(np.asarray(x)))
+
+
+def run_experiment(_config: DictConfig, base: str) -> float:
+    config = copy.deepcopy(_config)
+    n_devices = len(jax.devices())
+    config.num_devices = n_devices
+    config = check_total_timesteps(config)
+    env, eval_env = environments.make(config=config)
+    key, key_e, a_key, q_key = jax.random.split(jax.random.PRNGKey(config.arch.seed), 4)
+    learn, actor_network, ls, n_params = build_system(env, (key, a_key, q_key), config, base)
+    evaluator, _, _ = evaluator_setup(eval_env=eval_env, key_e=key_e,
+                                      eval_act_fn=get_distribution_act_fn(config, actor_network.apply),
+                                      params=ls.params.actor_params.online, config=config)
+    config.arch.num_updates_per_eval = config.arch.num_updates // config.arch.num_evaluation
+    steps_per_rollout = (n_devices * config.arch.num_updates_per_eval * config.system.rollout_length
+                         * config.arch.update_batch_size * config.arch.num_envs)
+    algo = str(config.system.get("algo_name") or f"cw_{base}_{config.system.head}")
+    os.makedirs(config.system.run_log_dir, exist_ok=True)
+    path = os.path.join(config.system.run_log_dir, f"{config.env.scenario.task_name}_{algo}_s{config.arch.seed}.jsonl")
+    flog = open(path, "w")
+    flog.write(json.dumps({"config": OmegaConf.to_container(config, resolve=True), "n_params": n_params}) + "\n")
+    print(f"{Fore.YELLOW}{Style.BRIGHT}{algo} ({base}, head={config.system.head}) critic params {n_params} -> {path}"
+          f"{Style.RESET_ALL}")
+    t0 = time.time()
+    rec = {}
+    for ev in range(config.arch.num_evaluation):
+        s0 = time.time()
+        out = learn(ls)
+        jax.block_until_ready(out)
+        el = time.time() - s0
+        t = int(steps_per_rollout * (ev + 1))
+        ep, any_done = get_final_step_metrics(out.episode_metrics)
+        rec = {"timestep": t, "sps": steps_per_rollout / el}
+        if any_done:
+            rec["train_return"] = _mean(ep["episode_return"]); rec["train_length"] = _mean(ep["episode_length"])
+        rec.update({k: _mean(v) for k, v in out.train_metrics.items()})
+        trained = unreplicate_batch_dim(out.learner_state.params.actor_params.online)
+        key_e, *eks = jax.random.split(key_e, n_devices + 1)
+        evo = evaluator(trained, jnp.stack(eks).reshape(n_devices, -1))
+        jax.block_until_ready(evo)
+        rec["eval_return"] = _mean(evo.episode_metrics["episode_return"])
+        rec["eval_length"] = _mean(evo.episode_metrics["episode_length"])
+        rec["wall"] = time.time() - t0
+        flog.write(json.dumps(rec) + "\n"); flog.flush()
+        print(f"t={t} eval={rec['eval_return']:.2f} sps={rec['sps']:.0f}", flush=True)
+        ls = out.learner_state
+    flog.write(json.dumps({"done": True, "wall": time.time() - t0}) + "\n")
+    flog.close()
+    return float(rec.get("eval_return", 0.0))

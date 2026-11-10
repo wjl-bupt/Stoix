@@ -1,0 +1,14 @@
+PASS xi == v_y u_x - v_x u_y (target=online)
+PASS qcw loss == centered TD (d=0, uniform W)
+PASS centered TD == m/(m-1) var(u)
+PASS pick0 diagnostic
+PASS TD3 critic loss == sum_k 0.5 mse(y_min)
+PASS d=1 -> y = r
+PASS rho W: same-group sum .5
+PASS rho W: cross-group sum .5
+PASS rho W: identical items weight 0
+PASS rho sampler: partners in anchor trajectory
+PASS rho sampler: partner != anchor (non-singleton)
+PASS rho sampler: obs gathered at idx
+PASS rho sampler: slots ~ uniform over one trajectory (cv<.1)
+13/13 passed

@@ -22,7 +22,41 @@ from stoa.core_wrappers.vmap import VmapWrapper
 from stoa.core_wrappers.wrapper import AddRNGKey
 from stoa.utility_wrappers.extras_transforms import NoExtrasWrapper
 
+import jax.numpy as jnp
+from stoa.core_wrappers.auto_reset import add_obs_to_extras
+from stoa.core_wrappers.wrapper import Wrapper
+
 from stoix.utils.env_factory import EnvFactory
+
+
+class BatchCondAutoResetVmap(Wrapper):
+    """2026-11-05: vmapped env with auto-reset decided by ONE lax.cond on any(done) over the batch (see
+    scripts_rdqn/patch_batchreset.py).  Equivalent to AutoResetWrapper + VmapWrapper, but the reset is only
+    computed on steps where at least one env ended."""
+
+    def __init__(self, env):
+        super().__init__(env)
+        self._vreset = jax.vmap(self._env.reset, in_axes=(0, None))
+        self._vstep = jax.vmap(self._env.step, in_axes=(0, 0, None))
+
+    def reset(self, rng_key, env_params=None):
+        state, ts = self._vreset(rng_key, env_params)
+        return state, add_obs_to_extras(ts)
+
+    def step(self, state, action, env_params=None):
+        state, ts = self._vstep(state, action, env_params)
+        ts = add_obs_to_extras(ts)
+        done = ts.done()
+
+        def _reset(args):
+            st, t = args
+            keys = jax.vmap(lambda k: jax.random.split(k)[0])(st.rng_key)
+            rs, rts = self._vreset(keys, env_params)
+            sel = lambda a, b: jnp.where(done.reshape(done.shape + (1,) * (a.ndim - done.ndim)), a, b)  # noqa
+            return jax.tree_util.tree_map(sel, rs, st), t.replace(
+                observation=jax.tree_util.tree_map(sel, rts.observation, t.observation))
+
+        return jax.lax.cond(jnp.any(done), _reset, lambda a: a, (state, ts))
 from stoix.wrappers.jax_to_factory import JaxEnvFactory
 
 
@@ -52,6 +86,8 @@ def apply_core_wrappers(env: Environment, config: DictConfig) -> Environment:
             min(config.env.get("reset_ratio", 16), config.arch.num_envs),
             next_obs_in_extras=True,
         )
+    elif config.env.get("batch_cond_reset", False):   # 11-05 (apply_core_wrappers = first occurrence)
+        env = BatchCondAutoResetVmap(env)
     else:
         if config.env.get("use_cached_auto_reset", False):
             env = CachedAutoResetWrapper(env, next_obs_in_extras=True)

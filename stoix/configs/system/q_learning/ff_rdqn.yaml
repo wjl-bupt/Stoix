@@ -51,3 +51,14 @@ vmin: -20.0
 vmax: 20.0
 reward_centering: False
 rc_beta: 0.001
+# --- same-trajectory pairing (2026-11-03; ff_rdqn rdqn / ff_rpair free|anti cross) ---
+same_traj: False
+st_group: 8           # group = 1 uniform anchor + (st_group-1) partners from its own trajectory
+st_random: False      # True (with same_traj): same group/pair structure, partners uniform over the buffer (control)
+st_cross: 0           # >0 (with same_traj): each anchor also gets st_cross partners from OTHER trajectories; loss = L_st + L_cross
+# --- AL / PAL (2026-11-03; alpal.py) ---
+al_mode: none        # none | al | pal
+al_alpha: 0.0
+# --- rho-kernel (2026-11-03): with same_traj=True, st_cross=0 ---
+pair_rho: null       # null: off; float: (1-rho) same-trajectory pairs + rho cross-group pairs
+rho_kc: 7            # ff_rpair: cross-group partners per slot

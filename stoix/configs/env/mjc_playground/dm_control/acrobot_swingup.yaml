@@ -1,0 +1,9 @@
+# ---Environment Configs---
+env_name: mujoco_playground
+
+scenario:
+  name: AcrobotSwingup
+  task_name: AcrobotSwingup
+
+kwargs: {}
+eval_metric: episode_return

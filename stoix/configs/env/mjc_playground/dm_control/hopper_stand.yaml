@@ -1,0 +1,9 @@
+# ---Environment Configs---
+env_name: mujoco_playground
+
+scenario:
+  name: HopperStand
+  task_name: HopperStand
+
+kwargs: {}
+eval_metric: episode_return

@@ -1,0 +1,12 @@
+#!/bin/bash
+# GPU0-3 placeholder (2026-11-04: was 0,1) (user's /home/junweiluo/trainer.py).  usage: bash scripts_rdqn/placeholder.sh start|stop|status
+PY=/home/junweiluo/OnPolicyRL/.venv/bin/python; T=/home/junweiluo/trainer.py; LOG=/home/junweiluo/trainer_placeholder.log
+running() { pgrep -f "$PY $T" > /dev/null; }
+case $1 in
+  start)  if running; then echo "placeholder already running"; else
+            cd /home/junweiluo/OnPolicyRL && nohup setsid $PY $T --gpus 0,1,2,3 >> $LOG 2>&1 < /dev/null &
+            sleep 3; running && echo "placeholder started" || { echo "placeholder FAILED, see $LOG"; tail -5 $LOG; }; fi ;;
+  stop)   pkill -f "$PY $T"; for i in $(seq 1 30); do running || break; sleep 1; done
+          running && { pkill -9 -f "$PY $T"; sleep 2; }; echo "placeholder stopped" ;;
+  status) running && echo "placeholder running: $(pgrep -f "$PY $T" | tr '\n' ' ')" || echo "placeholder not running" ;;
+esac

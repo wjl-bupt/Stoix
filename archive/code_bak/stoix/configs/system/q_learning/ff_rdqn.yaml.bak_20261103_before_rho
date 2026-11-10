@@ -1,0 +1,61 @@
+# --- Defaults FF-DQN ---
+
+
+# --- RL hyperparameters ---
+rollout_length: 2 # Number of environment steps per vectorised environment.
+epochs: 16 # Number of sgd steps per rollout.
+warmup_steps: 16  # Number of steps to collect before training.
+total_buffer_size: 1_000_000 # Total effective size of the replay buffer across all devices and vectorised update steps. This means each device has a buffer of size buffer_size//num_devices which is further divided by the update_batch_size. This value must be divisible by num_devices*update_batch_size.
+total_batch_size: 512 # Total effective number of samples to train on. This means each device has a batch size of batch_size/num_devices which is further divided by the update_batch_size. This value must be divisible by num_devices*update_batch_size.
+q_lr: 5e-4  # the learning rate of the Q network network optimizer
+tau: 0.005  # smoothing coefficient for target networks
+gamma: 0.99  # discount factor
+max_grad_norm: 0.5 # Maximum norm of the gradients for a weight update.
+decay_learning_rates: False # Whether learning rates should be linearly decayed during training.
+training_epsilon: 0.1  # epsilon for the epsilon-greedy policy during training
+evaluation_epsilon: 0.00  # epsilon for the epsilon-greedy policy during evaluation
+max_abs_reward : 1000.0  # maximum absolute reward value
+huber_loss_parameter: 0.0  # parameter for the huber loss. If 0, it uses MSE loss.
+
+# --- RDQN / CRN additions (ff_rdqn.py) ---
+system_name: ff_rdqn
+rdqn: False         # True: centred network loss + learned scalar c (Q~ = q + c)
+c_lr: 0.0           # step of the scalar: c <- c + c_lr * mean(delta), via optax.sgd(c_lr/2) on (mean delta)^2; RDQN uses 1.0
+crn: False          # True: counterfactual action from the same pre-step state (common random numbers)
+cf_pair_coef: 0.0   # optional pair term coef * 0.5 mean (u_a - u_b)^2 (only with crn)
+run_log_dir: /home/junweiluo/stoix_runs/phase1
+# --- MinAtar-protocol / baseline switches (ff_rdqn.py) ---
+double: False        # True: Double DQN target (online argmax, target value)
+target_period: 0     # >0: hard target copy (q and c) every N gradient updates; 0: Polyak with tau
+eps_start: 1.0
+eps_end: 0.1
+eps_decay_steps: 0   # >0: linear eps decay over this many env steps; 0: fixed training_epsilon
+algo_name: ""        # name used in the jsonl file (default derived from rdqn/crn)
+# --- RDQN-A (paper Alg. 2): closed-form anchor at first update and every target sync ---
+rdqn_a: False
+anchor_batch: 16384  # replay samples for the anchor (rounded down to a multiple of the batch size)
+anchor_omega: 1.0
+# --- n-step (2026-10-31) ---
+n_step: 1            # >1: n-step targets via a trajectory buffer
+c_mode: same         # same | sep_cor | sep_unc  (see ff_rdqn.py docstring)
+traj_buffer: False   # True with n_step=1: 1-step algorithm through the trajectory buffer (protocol check)
+reset_continuing: False  # True: termination -> transition to reset state, done stored as 0 (2026-10-31)
+# --- pair critic (ff_rpair.py, 2026-10-31) ---
+head: anti           # anti | free
+term: cross          # cross | unif
+cont_coef: 0.33      # BCE coefficient of the continuation head (term=unif)
+# --- baselines (2026-10-31) ---
+c51: False
+num_atoms: 51
+vmin: -20.0
+vmax: 20.0
+reward_centering: False
+rc_beta: 0.001
+# --- same-trajectory pairing (2026-11-03; ff_rdqn rdqn / ff_rpair free|anti cross) ---
+same_traj: False
+st_group: 8           # group = 1 uniform anchor + (st_group-1) partners from its own trajectory
+st_random: False      # True (with same_traj): same group/pair structure, partners uniform over the buffer (control)
+st_cross: 0           # >0 (with same_traj): each anchor also gets st_cross partners from OTHER trajectories; loss = L_st + L_cross
+# --- AL / PAL (2026-11-03; alpal.py) ---
+al_mode: none        # none | al | pal
+al_alpha: 0.0

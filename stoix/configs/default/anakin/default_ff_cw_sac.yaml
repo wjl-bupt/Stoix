@@ -1,0 +1,11 @@
+defaults:
+  - logger: logger
+  - arch: anakin
+  - system: ddpg/ff_cw_sac
+  - network: mlp_ddpg
+  - env: mjc_playground/dm_control/cartpole_balance
+  - _self_
+
+hydra:
+  searchpath:
+    - file://stoix/configs

@@ -20,6 +20,9 @@ real and the counterfactual step share every random draw (common random numbers)
 state is discarded.  Each buffer item holds both branches; the loss runs over the 2m transitions of a batch of m
 items (= relq_torch --cf_mode sum).  Optional pair term (system.cf_pair_coef > 0): + coef * 0.5 mean (u_a - u_b)^2.
 Env calls per real step: 2 with CRN, 1 without (logged as env_calls).
+system.cf_coupling (2026-11-02): crn (default, as above) | ind: the counterfactual step is taken from the same
+pre-step state but with every 'rng_key' leaf of the state replaced by an independent key (reseed_state), i.e.
+independent noise (incl. the pgx sticky-action draw).  With crn the key splits are unchanged from before.
 
 n-step (system.n_step = n > 1, 2026-10-31; trajectory buffer, sequences of n consecutive steps per env):
   G_n = sum_{i<n} g^i alive_i r_i,  Gamma_n = g^n alive_n,  alive_i = prod_{j<i} (1 - d_j)
@@ -44,6 +47,21 @@ Baselines (2026-10-31):
   system.reward_centering=True: simple reward centering (Naik et al. 2024): target uses r - rbar,
     rbar <- rbar + rc_beta * (mean batch reward - rbar) after every update.
 
+Same-trajectory pairing (system.same_traj=True, 2026-11-03; RDQN, plain replay only): the batch is built by
+same_traj.same_traj_batch (m/G uniform anchors, each with G-1 partners drawn uniformly from the other stored items of
+its own trajectory, G = system.st_group) and the centred network loss is replaced by its pair form restricted to
+ordered pairs inside a group:  L_q = 0.25 * sum_pairs w (u_x - u_y)^2  (w = 1/#pairs; with system.st_cross = K > 0 the
+anchors also get K cross-trajectory partners and w sums to 1 within each pair set, L_q = L_st + L_cross; for one group holding the whole
+batch this equals 0.5 m/(m-1) mean (u - mean u)^2).  The scalar step is unchanged (c <- c + c_lr * mean delta over
+the m items; every slot is uniform over the buffer).
+
+AL / PAL (system.al_mode = al | pal, system.al_alpha, 2026-11-03; alpal.py): target y - alpha * P(x) with the
+same-state gap penalty of the target network (DQN, RDQN, incl. same_traj).
+
+rho-kernel (system.pair_rho = rho with same_traj=True, st_cross=0; 2026-11-03): batch = groups of st_group slots of
+one trajectory; L_q = (1-rho) * same-trajectory pair loss (distinct items only) + rho * cross-group pair loss
+(closed form, same_traj.rdqn_rho_loss).  rho = 1/2 is the main setting.
+
 Per-evaluation records are appended to  <system.run_log_dir>/<name>.jsonl  (timestep, env_calls, eval/train return,
 c, q_tilde, td_std, ...).
 """
@@ -65,6 +83,8 @@ import numpy as np
 import optax
 from colorama import Fore, Style
 from flashbax.buffers.trajectory_buffer import BufferState
+from stoix.systems.q_learning.same_traj import same_traj_batch, rdqn_rho_loss
+from stoix.systems.q_learning.alpal import al_penalty
 from omegaconf import DictConfig, OmegaConf
 from stoa import Environment, TimeStep, WrapperState, get_final_step_metrics
 from typing_extensions import NamedTuple
@@ -143,9 +163,33 @@ class CFTransition(NamedTuple):
     cf_next_obs: chex.Array
 
 
+def reseed_state(env_state, key):
+    """Replace every leaf whose pytree path ends in an attribute/key named 'rng_key' (stoa AdapterStateWithKey and
+    wrappers) by an independent key derived from `key` (2026-11-02, cf_coupling=ind).  Raises if none is found."""
+    found = []
+
+    def f(path, x):
+        last = path[-1] if path else None
+        name = getattr(last, "name", None) or getattr(last, "key", None)
+        if name == "rng_key":
+            found.append(1)
+            k = jax.random.fold_in(key, len(found))
+            if x.dtype != jnp.uint32:
+                raise TypeError(f"cf_coupling=ind: rng_key leaf has dtype {x.dtype}, expected raw uint32 keys")
+            return jax.random.bits(k, x.shape, jnp.uint32)          # independent raw keys, same shape (per env)
+        return x
+
+    out = jax.tree_util.tree_map_with_path(f, env_state)
+    if not found:
+        raise ValueError("cf_coupling=ind: no 'rng_key' leaf in the environment state")
+    return out
+
+
 def make_step_fn(env: Environment, q_apply: Callable, config: DictConfig) -> Callable:
     """One environment step (+ the CRN counterfactual step).  Same key usage as ff_dqn when crn=False."""
     crn = bool(config.system.crn)
+    coupling = str(config.system.get("cf_coupling", "crn"))     # crn | ind  (2026-11-02)
+    assert coupling in ("crn", "ind")
     reset_cont = bool(config.system.get("reset_continuing", False))
     assert not (crn and reset_cont), "reset_continuing with CRN not supported"
     A = int(config.system.action_dim)
@@ -174,7 +218,11 @@ def make_step_fn(env: Environment, q_apply: Callable, config: DictConfig) -> Cal
         key, cf_key = jax.random.split(key)
         b = jax.random.randint(cf_key, action.shape, 0, A - 1)
         b = (b + (b >= action)).astype(action.dtype)              # b ~ Uniform(A minus {a})
-        _, cf_ts = env.step(env_state, b)                         # SAME pre-step state -> same noise; discarded
+        cf_state = env_state
+        if coupling == "ind":                                     # independent noise: fresh rng_key(s) in the state
+            key, ind_key = jax.random.split(key)
+            cf_state = reseed_state(env_state, ind_key)
+        _, cf_ts = env.step(cf_state, b)                          # crn: SAME pre-step state -> same noise; discarded
         tr = CFTransition(
             last_timestep.observation, action, timestep.reward, done, next_obs, info,
             b, cf_ts.reward, cf_ts.last().reshape(-1), cf_ts.extras["next_obs"],
@@ -293,6 +341,20 @@ def get_learner_fn(env, q_apply, net_apply, update_fns, buffer_fns, config) -> L
     assert c_mode in ("same", "sep_cor", "sep_unc")
     if use_traj:
         assert not crn and not rdqn_a, "n-step path: CRN / RDQN-A not supported"
+    al_mode = str(config.system.get("al_mode", "none")); al_alpha = float(config.system.get("al_alpha", 0.0))
+    if al_mode != "none":
+        assert al_mode in ("al", "pal") and not (use_traj or crn or c51 or rdqn_a), "AL/PAL: 1-step DQN/RDQN only"
+    same_traj = bool(config.system.get("same_traj", False))
+    st_group = int(config.system.get("st_group", 8))
+    pair_rho = config.system.get("pair_rho", None)          # 2026-11-03: rho-kernel (same + cross-group pairs)
+    if pair_rho is not None:
+        pair_rho = float(pair_rho)
+        assert same_traj and int(config.system.get("st_cross", 0)) == 0 and not bool(config.system.get("st_random", False))
+    if same_traj:
+        # 2026-11-08: same_traj also allowed for plain DQN (rdqn=False): only the batch construction changes
+        # (grouped same-trajectory sampler); the DQN loss ignores the pairs.
+        assert not (use_traj or crn or rdqn_a or c51 or reward_centering), "same_traj: plain DQN/RDQN only"
+        assert rdqn or pair_rho is None, "pair_rho needs rdqn"
 
     def _update_step(learner_state: OffPolicyLearnerState, _: Any):
         def _env_step(learner_state: OffPolicyLearnerState, _: Any):
@@ -305,7 +367,7 @@ def get_learner_fn(env, q_apply, net_apply, update_fns, buffer_fns, config) -> L
         buffer_state = buffer_add_fn(buffer_state, traj_batch)
         opt_states = {**opt_states, "t": opt_states["t"] + env_steps_per_update}
 
-        def _loss_fn(p: Dict, tp: Dict, tr: Any, rbar=0.0):
+        def _loss_fn(p: Dict, tp: Dict, tr: Any, rbar=0.0, pairs=None):
             if use_traj:
                 return nstep_loss(p, tp, tr, net_apply, gamma, n_step, c_mode, rdqn, double,
                                   float(config.system.max_abs_reward))
@@ -347,10 +409,19 @@ def get_learner_fn(env, q_apply, net_apply, update_fns, buffer_fns, config) -> L
             else:
                 v_t = jnp.max(q_t, axis=-1)
             y = jax.lax.stop_gradient(rew + d_t * (v_t + tp["c"]))
+            if al_mode != "none":                       # AL / PAL correction from the target network (alpal.py)
+                pen = al_penalty(net_apply(tp["q"], obs).preferences, q_t, act, don, al_mode)
+                y = y - al_alpha * pen
             qa = q_tm1[jnp.arange(act.shape[0]), act]
             u = y - qa
             c = p["c"]
-            if rdqn:
+            if rdqn and pairs is not None and pair_rho is not None:   # rho-kernel (same_traj.rdqn_rho_loss)
+                ix, iy, w, idx_ = pairs
+                net_loss, l_same, l_cross = rdqn_rho_loss(u, ix, iy, w, st_group, pair_rho, idx_)
+            elif rdqn and pairs is not None:          # same-trajectory pairs: 0.25 sum_w (u_x - u_y)^2
+                ix, iy, w = pairs[:3]
+                net_loss = 0.25 * jnp.sum(w * jnp.square(u[ix] - u[iy]))
+            elif rdqn:
                 net_loss = 0.5 * jnp.mean(jnp.square(u - jnp.mean(u)))
             else:
                 net_loss = 0.5 * jnp.mean(jnp.square(u - jax.lax.stop_gradient(c)))
@@ -368,6 +439,10 @@ def get_learner_fn(env, q_apply, net_apply, update_fns, buffer_fns, config) -> L
                 "c": c,
                 "term_frac": jnp.mean(don.astype(jnp.float32)),
             }
+            if al_mode != "none":
+                info["al_pen"] = jnp.mean(pen)
+            if rdqn and pairs is not None and pair_rho is not None:
+                info["l_same"] = l_same; info["l_cross"] = l_cross
             if reward_centering:
                 info["rbar"] = rbar
             return net_loss + c_loss, info
@@ -375,9 +450,18 @@ def get_learner_fn(env, q_apply, net_apply, update_fns, buffer_fns, config) -> L
         def _update_epoch(update_state: Tuple, _: Any) -> Tuple:
             params, opt_states, buffer_state, key = update_state
             key, sample_key = jax.random.split(key)
-            transitions = buffer_sample_fn(buffer_state, sample_key).experience
             rbar = opt_states["rbar"]
-            grads, loss_info = jax.grad(_loss_fn, has_aux=True)(params.online, params.target, transitions, rbar)
+            if same_traj:
+                transitions, ix, iy, w, st, idx_ = same_traj_batch(
+                    buffer_state, sample_key, int(config.system.batch_size), st_group, int(config.arch.num_envs),
+                    random_groups=bool(config.system.get("st_random", False)),
+                    n_cross=int(config.system.get("st_cross", 0)), return_idx=True)
+                grads, loss_info = jax.grad(_loss_fn, has_aux=True)(params.online, params.target, transitions, rbar,
+                                                                    (ix, iy, w, idx_))
+                loss_info = {**loss_info, **st}
+            else:
+                transitions = buffer_sample_fn(buffer_state, sample_key).experience
+                grads, loss_info = jax.grad(_loss_fn, has_aux=True)(params.online, params.target, transitions, rbar)
             grads, loss_info = jax.lax.pmean((grads, loss_info), axis_name="batch")
             grads, loss_info = jax.lax.pmean((grads, loss_info), axis_name="device")
             q_upd, q_opt = q_update_fn(grads["q"], opt_states["q"])
@@ -626,6 +710,12 @@ def run_experiment(_config: DictConfig) -> float:
         rec["wall"] = time.time() - t0
         logger.log(evaluator_output.episode_metrics, t, eval_step, LogEvent.EVAL)
         flog.write(json.dumps(rec) + "\n"); flog.flush()
+        _ck = config.system.get("ckpt_dir")                # 2026-11-08 checkpoints at 20/40/60/80/100%
+        if _ck and (eval_step + 1) % max(1, config.arch.num_evaluation // 5) == 0:
+            import pickle
+            os.makedirs(_ck, exist_ok=True)
+            with open(os.path.join(_ck, f"{config.env.scenario.task_name}_{algo}_s{config.arch.seed}_t{t}.pkl"), "wb") as _fh:
+                pickle.dump(jax.device_get(trained_params), _fh)
         learner_state = learner_output.learner_state
 
     flog.write(json.dumps({"done": True, "wall": time.time() - t0}) + "\n")

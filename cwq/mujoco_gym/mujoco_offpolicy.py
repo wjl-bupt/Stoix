@@ -1,0 +1,388 @@
+"""Gym MuJoCo (Gymnasium v5) off-policy baselines + CW-Q-rho, single file, JAX on CPU.  2026-11-07.
+
+Protocol = CleanRL defaults (td3_continuous_action / ddpg_continuous_action / sac_continuous_action), which follow
+Fujimoto et al. 2018 (TD3) and Haarnoja et al. 2018 (SAC):
+  1 env, 1M env steps, one gradient update per env step (UTD 1), batch 256, replay 1M (no wrap-around), gamma .99,
+  tau .005, MLP 256x256 ReLU for actor and critic, Adam, no observation / reward normalisation, no grad clipping.
+  TD3 : lr 3e-4 (actor & critic), 25k uniform-random warm-up steps, exploration noise N(0, .1*scale),
+        target policy smoothing .2 clipped at .5 (x scale), policy delay 2 (actor + all target nets every 2 steps).
+  DDPG: as TD3 but ONE critic, no target smoothing (CleanRL DDPG keeps policy delay 2).
+  SAC : q lr 1e-3, policy lr 3e-4, alpha lr 1e-3, auto alpha, target entropy -|A|, 5k random warm-up steps,
+        policy_frequency 2 with 2 actor/alpha steps each time (CleanRL), target nets every step,
+        log_std = -5 + 3.5 (tanh(.) + 1)  in [-5, 2].
+  Time-limit truncation is NOT termination (bootstrapped); only true failure termination sets d = 1.
+  Evaluation every 5000 env steps: 10 episodes on a separate env, deterministic policy (SAC: tanh(mean)).
+  Network init: flax defaults (lecun-normal weights, zero bias), as CleanRL's JAX scripts.
+
+head = qcw (CW-Q, on a TD3 / DDPG base): the same unary critic Q(s,a); all-pairs loss with the cross-weighted
+residual of the discrete CW-Pair (identical to stoix/systems/ddpg/cw_continuous.py, head=qcw):
+  D = Q(x) - Q(y), M = qn(x) - qn(y), Amax = qn(x) - Q^-(y), Bmin = Q^-(x) - qn(y),
+  qn = min_k Q_k^-(s', a~) (shared), Q^- = each critic's own target at (s, a);
+  T = sg[D + xi/(1-g)],  loss_k = 0.5 sum_ij W_ij (T - D)^2.
+sampler = rho: m/G anchors uniform over the buffer, each with G-1 partners uniform (with replacement) from the other
+stored items of its own trajectory (trajectory boundary = terminated OR truncated); W = rho_weight_matrix:
+same-group distinct-item pairs share 1-rho, cross-group distinct-item pairs share rho (same_traj.py).
+
+Diagnostics logged for twin-critic arms: pick0 = fraction of next-state targets where critic 0 gives the min,
+lvl_gap = mean(Q_0^- - Q_1^-)(s', a~), q_spread = std over the batch of Q_0^-(s', a~).
+"""
+import argparse, json, os, sys, time
+if os.environ.get("KEEPALIVE") == "1":      # GPU driver workaround (see Stoix keepalive.py): never unload executables
+    sys.path.insert(0, "/home/junweiluo/Stoix/stoix/systems/ddpg"); import keepalive  # noqa
+import numpy as np
+import jax, jax.numpy as jnp
+import flax.linen as nn
+import optax
+import gymnasium as gym
+
+
+# ------------------------------------------------------------------ networks
+class QNet(nn.Module):
+    @nn.compact
+    def __call__(self, s, a):
+        x = jnp.concatenate([s, a], -1)
+        x = nn.relu(nn.Dense(256)(x)); x = nn.relu(nn.Dense(256)(x))
+        return nn.Dense(1)(x)[..., 0]
+
+
+class DetActor(nn.Module):
+    act_dim: int
+    @nn.compact
+    def __call__(self, s):
+        x = nn.relu(nn.Dense(256)(s)); x = nn.relu(nn.Dense(256)(x))
+        return jnp.tanh(nn.Dense(self.act_dim)(x))          # in [-1, 1]; scaled outside
+
+
+class GaussActor(nn.Module):
+    act_dim: int
+    @nn.compact
+    def __call__(self, s):
+        x = nn.relu(nn.Dense(256)(s)); x = nn.relu(nn.Dense(256)(x))
+        mean = nn.Dense(self.act_dim)(x)
+        log_std = jnp.tanh(nn.Dense(self.act_dim)(x))
+        log_std = -5.0 + 0.5 * (2.0 - (-5.0)) * (log_std + 1.0)
+        return mean, log_std
+
+
+# ------------------------------------------------------------------ CW residual (copied from cw_continuous.py)
+def cross_xi(D_sg, M, Amax, Bmin, rx, ry, dx, dy, gamma):
+    k = (1.0 - gamma) / gamma
+    Gx, Gy = gamma * (1.0 - dx), gamma * (1.0 - dy)
+    vx, vy = 1.0 - Gx, 1.0 - Gy
+    W1 = k * Gx * Gy
+    W2 = Gx * (vy - k * Gy)
+    W3 = Gy * (vx - k * Gx)
+    W4 = -vy - Gy * (vx - k * Gx)
+    return vy * rx - vx * ry + W1 * M + W2 * Amax + W3 * Bmin + W4 * D_sg
+
+
+def rho_weight_matrix(idx, G, rho):
+    m = idx.shape[0]
+    grp = jnp.arange(m) // G
+    distinct = idx[:, None] != idx[None, :]
+    same = (grp[:, None] == grp[None, :]) & distinct
+    cross = (grp[:, None] != grp[None, :]) & distinct
+    Ws = same.astype(jnp.float32); Wc = cross.astype(jnp.float32)
+    return (1.0 - rho) * Ws / jnp.maximum(Ws.sum(), 1.0) + rho * Wc / jnp.maximum(Wc.sum(), 1.0)
+
+
+def critic_loss_fn(qnet, qp, tqp, b, a_n, gamma, head, W, min_mode="raw", no_norm=0):
+    """qp, tqp: tuples of critic params (1 or 2).  Returns (loss, info).
+    head q   : standard TD to y = r + g(1-d) min_k Q_k^-(s',a~)
+    head qcw : CW-Q all-pairs loss (cross-weighted residual xi)
+    head qct : ablation 2026-11-07 "centered TD": same pairs / W, pair error T - D = u_x - u_y with
+               u = r + g(1-d) qn - Q(s,a)  (no cross weighting; identical to qcw when no pair contains a terminal)
+    min_mode centered (2 critics, ablation 2026-11-07): c_j = batch mean of Q_j^-(s',a~); critic k uses
+               qn_k = min_j (Q_j^- - c_j) + c_k  (min taken on level-free values, then put on critic k's own level).
+    min_mode none (2026-11-08): no min; critic k bootstraps from its own target Q_k^-(s',a~) (TD3 minus clipped double Q;
+               the actor reads critic 0 only, so critic 1 is an unused independent copy)."""
+    nk = len(qp)
+    qn_k = jnp.stack([qnet.apply(tqp[k], b["next_obs"], a_n) for k in range(nk)])
+    qn = jnp.min(qn_k, 0)
+    if min_mode == "centered" and nk == 2:
+        c = jnp.mean(qn_k, axis=1, keepdims=True)
+        m_c = jnp.min(qn_k - c, 0)
+        qn_own = [m_c + c[k, 0] for k in range(nk)]
+    elif min_mode == "none":                       # 2026-11-08: no clipped double Q, each critic its own target
+        qn_own = [qn_k[k] for k in range(nk)]
+    else:
+        qn_own = [qn] * nk
+    r, d = b["r"], b["d"]
+    info = {}
+    if nk == 2:
+        cc = jnp.mean(qn_k, axis=1, keepdims=True)
+        info.update({"pick0": jnp.mean((qn_k[0] <= qn_k[1]).astype(jnp.float32)),
+                     "pick0c": jnp.mean((qn_k[0] - cc[0] <= qn_k[1] - cc[1]).astype(jnp.float32)),
+                     "lvl_gap": jnp.mean(qn_k[0] - qn_k[1])})
+    info["q_spread"] = jnp.std(qn_k[0])
+    loss = 0.0
+    for k in range(nk):
+        q_on = qnet.apply(qp[k], b["obs"], b["action"])
+        qn = qn_own[k]
+        if head == "q":
+            y = jax.lax.stop_gradient(r + gamma * (1.0 - d) * qn)
+            lk = 0.5 * jnp.mean(jnp.square(y - q_on))
+        elif head == "qct":
+            D = q_on[:, None] - q_on[None, :]
+            y = r + gamma * (1.0 - d) * qn
+            T = jax.lax.stop_gradient(y[:, None] - y[None, :])
+            lk = 0.5 * jnp.sum(W * jnp.square(T - D))
+        else:
+            q_t = qnet.apply(tqp[k], b["obs"], b["action"])
+            D = q_on[:, None] - q_on[None, :]
+            M = qn[:, None] - qn[None, :]
+            Amx = qn[:, None] - q_t[None, :]
+            Bmn = q_t[:, None] - qn[None, :]
+            xi = cross_xi(jax.lax.stop_gradient(D), M, Amx, Bmn, r[:, None], r[None, :], d[:, None], d[None, :], gamma)
+            T = jax.lax.stop_gradient(D + xi / (1.0 if no_norm else 1.0 - gamma))   # 2026-11-10 no_norm
+            lk = 0.5 * jnp.sum(W * jnp.square(T - D))
+        loss = loss + lk
+        if k == 0:
+            u = r + gamma * (1.0 - d) * qn - q_on
+            info.update({"q_mean": jnp.mean(q_on), "u_mean": jnp.mean(u), "u_std": jnp.std(u)})
+    return loss, info
+
+
+# ------------------------------------------------------------------ replay (host, numpy; no wrap-around)
+class Replay:
+    def __init__(self, n, od, ad):
+        self.obs = np.zeros((n, od), np.float32); self.nobs = np.zeros((n, od), np.float32)
+        self.act = np.zeros((n, ad), np.float32); self.r = np.zeros(n, np.float32); self.d = np.zeros(n, np.float32)
+        self.ep = np.zeros(n, np.int64)                    # trajectory id of each item
+        self.starts = np.zeros(n + 2, np.int64)            # start index of each trajectory (traj 0 starts at 0)
+        self.ne = 1                                        # trajectories begun so far (last one = ongoing)
+        self.n = 0; self.cap = n
+
+    def add(self, o, a, r, no, d, end):
+        i = self.n; assert i < self.cap, "replay full (no wrap-around by design)"
+        self.obs[i] = o; self.act[i] = a; self.r[i] = r; self.nobs[i] = no; self.d[i] = d
+        self.ep[i] = self.ne - 1
+        self.n += 1
+        if end:
+            self.starts[self.ne] = self.n; self.ne += 1
+
+    def _get(self, idx):
+        return {"obs": self.obs[idx], "action": self.act[idx], "r": self.r[idx], "d": self.d[idx],
+                "next_obs": self.nobs[idx]}
+
+    def sample_uniform(self, rng, m):
+        idx = rng.integers(0, self.n, m)
+        return self._get(idx), idx
+
+    def sample_rho(self, rng, m, G):
+        """same_traj_batch semantics (n_cross = 0) for a single env without wrap-around."""
+        ng = m // G
+        a = rng.integers(0, self.n, ng)
+        e = self.ep[a]
+        st = self.starts[e]
+        nxt = np.where(e + 1 < self.ne, self.starts[np.minimum(e + 1, self.ne - 1)], self.n)  # exclusive end
+        ln = nxt - st
+        u = (rng.random((ng, G - 1)) * np.maximum(ln - 1, 1)[:, None]).astype(np.int64)
+        p = st[:, None] + u
+        p = p + (p >= a[:, None])                          # skip the anchor itself
+        p = np.where(ln[:, None] >= 2, p, a[:, None])      # singleton trajectory: partner = anchor (masked)
+        idx = np.concatenate([a[:, None], p], 1).reshape(-1)
+        return self._get(idx), idx
+
+
+# ------------------------------------------------------------------ main
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--env", default="Hopper-v5"); ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--base", default="td3", choices=["td3", "ddpg", "sac"])
+    ap.add_argument("--head", default="q", choices=["q", "qcw", "qct"])
+    ap.add_argument("--min_mode", default="raw", choices=["raw", "centered", "none"])
+    ap.add_argument("--no_norm", type=int, default=0)        # 2026-11-10: 1 = CW residual without 1/(1-gamma)
+    ap.add_argument("--sampler", default="uniform", choices=["uniform", "rho"])
+    ap.add_argument("--rho", type=float, default=0.5); ap.add_argument("--G", type=int, default=8)
+    ap.add_argument("--total", type=int, default=1_000_000); ap.add_argument("--batch", type=int, default=256)
+    ap.add_argument("--eval_every", type=int, default=5000); ap.add_argument("--eval_eps", type=int, default=10)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--ckpt_dir", default="")             # 2026-11-08: save actor/critic at 20/40/60/80/100%
+    A = ap.parse_args()
+    assert not (A.base == "sac" and A.head != "q")
+    gamma, tau = 0.99, 0.005
+    sac = A.base == "sac"
+    nk = 1 if A.base == "ddpg" else 2
+    lr_a = 3e-4; lr_q = 1e-3 if sac else 3e-4
+    start = 5000 if sac else 25000
+    pol_freq = 2
+
+    env = gym.make(A.env); eenv = gym.make(A.env)
+    od = env.observation_space.shape[0]; ad = env.action_space.shape[0]
+    lo, hi = env.action_space.low.astype(np.float32), env.action_space.high.astype(np.float32)
+    scale, bias = (hi - lo) / 2.0, (hi + lo) / 2.0
+    env.action_space.seed(A.seed)
+    rng = np.random.default_rng(A.seed)
+    key = jax.random.PRNGKey(A.seed)
+
+    qnet = QNet()
+    actor = GaussActor(ad) if sac else DetActor(ad)
+    s0, a0 = jnp.zeros((1, od)), jnp.zeros((1, ad))
+    keys = jax.random.split(key, 4 + nk); key = keys[0]
+    ap_ = actor.init(keys[1], s0)
+    qp = tuple(qnet.init(keys[4 + k], s0, a0) for k in range(nk))
+    tap, tqp = ap_, qp
+    a_opt = optax.adam(lr_a); q_opt = optax.adam(lr_q)
+    a_os = a_opt.init(ap_); q_os = q_opt.init(qp)
+    log_alpha = jnp.zeros(()); al_opt = optax.adam(lr_q); al_os = al_opt.init(log_alpha)
+    target_ent = -float(ad)
+    sc, bi = jnp.asarray(scale), jnp.asarray(bias)
+
+    # ---------------- deterministic bases (td3 / ddpg, head q / qcw)
+    def det_update(ap_, tap, qp, tqp, a_os, q_os, b, W, k, do_actor):
+        a_n = actor.apply(tap, b["next_obs"]) * sc + bi
+        if A.base == "td3":
+            noise = jnp.clip(jax.random.normal(k, a_n.shape) * 0.2, -0.5, 0.5) * sc
+            a_n = jnp.clip(a_n + noise, lo, hi)
+        (ql, info), g = jax.value_and_grad(lambda p: critic_loss_fn(qnet, p, tqp, b, a_n, gamma, A.head, W, A.min_mode, A.no_norm),
+                                           has_aux=True)(qp)
+        upd, q_os = q_opt.update(g, q_os, qp); qp = optax.apply_updates(qp, upd)
+        info["q_loss"] = ql
+
+        def do(args):
+            ap_, tap, tqp, a_os = args
+            al, ga = jax.value_and_grad(lambda p: -jnp.mean(qnet.apply(qp[0], b["obs"], actor.apply(p, b["obs"]) * sc + bi)))(ap_)
+            upd, a_os = a_opt.update(ga, a_os, ap_); ap_ = optax.apply_updates(ap_, upd)
+            tap = optax.incremental_update(ap_, tap, tau); tqp = optax.incremental_update(qp, tqp, tau)
+            return ap_, tap, tqp, a_os, al
+        ap_, tap, tqp, a_os, al = jax.lax.cond(do_actor, do, lambda x: (*x, jnp.float32(jnp.nan)), (ap_, tap, tqp, a_os))
+        info["actor_loss"] = al
+        return ap_, tap, qp, tqp, a_os, q_os, info
+
+    # ---------------- SAC (CleanRL)
+    def sac_sample(p, s, k):
+        mean, log_std = actor.apply(p, s)
+        std = jnp.exp(log_std)
+        x = mean + std * jax.random.normal(k, mean.shape)
+        y = jnp.tanh(x)
+        a = y * sc + bi
+        logp = -0.5 * jnp.square((x - mean) / std) - log_std - 0.5 * jnp.log(2 * jnp.pi)
+        logp = logp - jnp.log(sc * (1 - jnp.square(y)) + 1e-6)
+        return a, jnp.sum(logp, -1)
+
+    def sac_update(ap_, qp, tqp, a_os, q_os, log_alpha, al_os, b, k, do_actor):
+        k1, k2, k3 = jax.random.split(k, 3)
+        alpha = jnp.exp(log_alpha)
+        a_n, lp_n = sac_sample(ap_, b["next_obs"], k1)
+        qn_k = jnp.stack([qnet.apply(tqp[i], b["next_obs"], a_n) for i in range(2)])
+        y = jax.lax.stop_gradient(b["r"] + gamma * (1 - b["d"]) * (jnp.min(qn_k, 0) - alpha * lp_n))
+
+        def ql_fn(p):
+            qs = [qnet.apply(p[i], b["obs"], b["action"]) for i in range(2)]
+            return sum(0.5 * jnp.mean(jnp.square(q - y)) for q in qs), qs[0]
+        (ql, q0), g = jax.value_and_grad(ql_fn, has_aux=True)(qp)
+        upd, q_os = q_opt.update(g, q_os, qp); qp = optax.apply_updates(qp, upd)
+        info = {"q_loss": ql, "q_mean": jnp.mean(q0), "u_std": jnp.std(y - q0),
+                "pick0": jnp.mean((qn_k[0] <= qn_k[1]).astype(jnp.float32)), "lvl_gap": jnp.mean(qn_k[0] - qn_k[1]),
+                "q_spread": jnp.std(qn_k[0])}
+
+        def do(args):
+            ap_, a_os, log_alpha, al_os, kk = args
+            for j in range(pol_freq):                       # CleanRL: compensate the delay
+                kk, ka, kb = jax.random.split(kk, 3)
+                alpha = jnp.exp(log_alpha)
+
+                def al_fn(p):
+                    a, lp = sac_sample(p, b["obs"], ka)
+                    q = jnp.min(jnp.stack([qnet.apply(qp[i], b["obs"], a) for i in range(2)]), 0)
+                    return jnp.mean(alpha * lp - q), lp
+                (al, lp), ga = jax.value_and_grad(al_fn, has_aux=True)(ap_)
+                upd, a_os = a_opt.update(ga, a_os, ap_); ap_ = optax.apply_updates(ap_, upd)
+                _, lp2 = sac_sample(ap_, b["obs"], kb)
+                lp2 = jax.lax.stop_gradient(lp2)
+                gl = jax.grad(lambda la: jnp.mean(-jnp.exp(la) * (lp2 + target_ent)))(log_alpha)
+                upd, al_os = al_opt.update(gl, al_os, log_alpha); log_alpha = optax.apply_updates(log_alpha, upd)
+            return ap_, a_os, log_alpha, al_os, al, -jnp.mean(lp)
+        ap_, a_os, log_alpha, al_os, al, ent = jax.lax.cond(
+            do_actor, do, lambda x: (*x[:4], jnp.float32(jnp.nan), jnp.float32(jnp.nan)), (ap_, a_os, log_alpha, al_os, k3))
+        tqp = optax.incremental_update(qp, tqp, tau)
+        info.update({"actor_loss": al, "entropy": ent, "alpha": jnp.exp(log_alpha)})
+        return ap_, qp, tqp, a_os, q_os, log_alpha, al_os, info
+
+    det_update = jax.jit(det_update); sac_update = jax.jit(sac_update)
+    wmat = jax.jit(lambda idx: rho_weight_matrix(idx, A.G, A.rho))
+    W_unif = jnp.asarray((1.0 - np.eye(A.batch)) / (A.batch * (A.batch - 1)), jnp.float32)
+
+    @jax.jit
+    def act_explore(p, s, k):
+        if sac:
+            return sac_sample(p, s[None], k)[0][0]
+        a = actor.apply(p, s[None])[0] * sc + bi
+        return jnp.clip(a + jax.random.normal(k, a.shape) * 0.1 * sc, lo, hi)
+
+    @jax.jit
+    def act_greedy(p, s):
+        if sac:
+            return jnp.tanh(actor.apply(p, s[None])[0][0]) * sc + bi
+        return actor.apply(p, s[None])[0] * sc + bi
+
+    def evaluate(p, n_ep, seed):
+        rets, lens = [], []
+        for i in range(n_ep):
+            o, _ = eenv.reset(seed=seed + i); done = False; R = 0.0; L = 0
+            while not done:
+                o, r, te, tr, _ = eenv.step(np.asarray(act_greedy(p, jnp.asarray(o, jnp.float32))))
+                R += r; L += 1; done = te or tr
+            rets.append(R); lens.append(L)
+        return float(np.mean(rets)), float(np.mean(lens))
+
+    buf = Replay(A.total, od, ad)
+    os.makedirs(os.path.dirname(A.out) or ".", exist_ok=True)
+    flog = open(A.out, "w")
+    flog.write(json.dumps({"config": vars(A), "lr_actor": lr_a, "lr_q": lr_q, "start": start, "n_critics": nk}) + "\n")
+    o, _ = env.reset(seed=A.seed)
+    ep_ret, ep_len, recent, n_term, n_trunc = 0.0, 0, [], 0, 0
+    infos = []; t0 = time.time(); t_last = t0; n_upd = 0
+    for t in range(1, A.total + 1):
+        if t <= start:
+            a = env.action_space.sample()
+        else:
+            key, k = jax.random.split(key)
+            a = np.asarray(act_explore(ap_, jnp.asarray(o, jnp.float32), k))
+        no, r, te, tr, _ = env.step(a)
+        buf.add(o, a, r, no, float(te), te or tr)
+        ep_ret += r; ep_len += 1; o = no
+        if te or tr:
+            recent.append(ep_ret); recent = recent[-10:]; n_term += int(te); n_trunc += int(tr and not te)
+            o, _ = env.reset(); ep_ret, ep_len = 0.0, 0
+        if t > start:
+            if A.sampler == "rho":
+                b, idx = buf.sample_rho(rng, A.batch, A.G); W = wmat(jnp.asarray(idx))
+            else:
+                b, idx = buf.sample_uniform(rng, A.batch); W = W_unif
+            b = {kk: jnp.asarray(v) for kk, v in b.items()}
+            key, k = jax.random.split(key)
+            do_actor = jnp.asarray(n_upd % pol_freq == 0)
+            if sac:
+                ap_, qp, tqp, a_os, q_os, log_alpha, al_os, info = sac_update(
+                    ap_, qp, tqp, a_os, q_os, log_alpha, al_os, b, k, do_actor)
+            else:
+                ap_, tap, qp, tqp, a_os, q_os, info = det_update(ap_, tap, qp, tqp, a_os, q_os, b, W, k, do_actor)
+            n_upd += 1
+            if n_upd % 1000 == 1:                           # an update that also stepped the actor
+                infos.append(jax.device_get(info))
+        if t % A.eval_every == 0:
+            er, el = evaluate(ap_, A.eval_eps, 10_000 * (A.seed + 1) + t // A.eval_every * 100)
+            now = time.time()
+            rec = {"timestep": t, "eval_return": er, "eval_length": el,
+                   "train_return": float(np.mean(recent)) if recent else None,
+                   "n_term": n_term, "n_trunc": n_trunc, "sps": A.eval_every / (now - t_last), "wall": now - t0}
+            if infos:
+                for kk in infos[0]:
+                    rec[kk] = float(np.nanmean([float(x[kk]) for x in infos]))
+            infos = []; t_last = now
+            flog.write(json.dumps(rec) + "\n"); flog.flush()
+        if A.ckpt_dir and t % (A.total // 5) == 0:
+            import pickle
+            os.makedirs(A.ckpt_dir, exist_ok=True)
+            _nm = os.path.basename(A.out).replace(".jsonl", "")
+            with open(os.path.join(A.ckpt_dir, f"{_nm}_t{t}.pkl"), "wb") as _fh:
+                pickle.dump(jax.device_get({"actor": ap_, "q": qp, "args": vars(A)}), _fh)
+    flog.write(json.dumps({"done": True, "wall": time.time() - t0}) + "\n"); flog.close()
+    if os.environ.get("KEEPALIVE") == "1":
+        os._exit(0)
+
+
+if __name__ == "__main__":
+    main()

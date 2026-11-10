@@ -1,0 +1,40 @@
+"""2026-11-06 workaround for the driver heap corruption in cuModuleUnload (gdb: free() <- libcuda <- cuModuleUnload <-
+XLA executable destructor; crashes are triggered when Python frees a jitted function / executable, e.g. weakref
+callbacks during build_system, or at interpreter teardown).  Import FIRST (before jax users):
+  - keeps a strong reference to every function returned by jax.jit / jax.pmap -> their executables are never
+    destroyed -> no cuModuleUnload during the run;
+  - gc.disable() -> no cyclic-GC-triggered frees of jit wrappers;
+  - hard_exit(): os._exit after flushing, skipping the teardown that unloads every module."""
+import gc, os, sys
+import jax
+
+_KEEP = []
+_jit, _pmap = jax.jit, jax.pmap
+
+
+def _keep(f):
+    _KEEP.append(f)
+    return f
+
+
+def jit(*a, **k):
+    if a and callable(a[0]):
+        return _keep(_jit(*a, **k))
+    dec = _jit(*a, **k)          # decorator-with-kwargs form
+    return lambda fn: _keep(dec(fn))
+
+
+def pmap(*a, **k):
+    if a and callable(a[0]):
+        return _keep(_pmap(*a, **k))
+    dec = _pmap(*a, **k)
+    return lambda fn: _keep(dec(fn))
+
+
+jax.jit, jax.pmap = jit, pmap
+gc.disable()
+
+
+def hard_exit(code=0):
+    sys.stdout.flush(); sys.stderr.flush()
+    os._exit(code)

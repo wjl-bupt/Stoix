@@ -1,0 +1,205 @@
+"""Same-trajectory pairing for the flat (item) replay buffer of ff_rdqn / ff_rpair.  2026-11-03.
+
+Buffer layout (flashbax item buffer, add_batches=True, add_sequences=True, rollout_length=1):
+every env step appends num_envs items in env order 0..E-1, so the item written as number n (n = 0, 1, ...) is
+env n mod E at step n // E and sits at ring position n mod L.  Total writes W are a multiple of E, hence the item at
+offset o back from the write pointer p (o = 1 is the newest) belongs to env e = (-o) mod E, age j = (o + e) / E
+(j = 1: last step).  A trajectory = the items of one env between two stored done flags (done = timestep.last(),
+the episode ends WITH its done item).  Items older than the valid window are treated as boundaries.
+
+Batch construction (system.same_traj=True, group size G = system.st_group, m = batch size, m % G == 0):
+  m / G anchors drawn uniformly from all valid items; every anchor brings G - 1 partners drawn uniformly (with
+  replacement) from the OTHER items of its own trajectory.  The m items are the batch; pairs = all ordered pairs of
+  distinct slots inside a group (G (G-1) per group); a pair is masked out if both slots hold the same item or the
+  trajectory has a single stored item.  Each slot's marginal is uniform over valid items (anchor uniform, partner
+  uniform within the anchor's trajectory), so the per-item part of a loss (e.g. the RDQN scalar c) is unchanged in
+  expectation; only the pairing structure changes.
+
+random_groups=True (2026-11-03 control "rg"): identical group/pair structure and weights, but the G-1 partners are
+drawn uniformly from ALL valid items (independent of the anchor), i.e. only the trajectory constraint is removed.
+
+n_cross > 0 (2026-11-03 "mix"): the same-trajectory groups are kept unchanged and every anchor additionally gets
+n_cross partners drawn uniformly from the buffer items NOT in its trajectory (a draw that lands in the anchor's own
+trajectory is masked).  These n_grp * n_cross items are appended to the batch (batch = m + n_grp * n_cross items) and
+paired with their anchor in both orders.  Weights: same-trajectory pairs sum to 1 and cross pairs sum to 1, so
+sum_j w_j (...) = L_same_traj + L_cross (two means, coefficient 1 each).
+
+boundary (2026-11-04): optional fn exp -> [L] episode-end flags used to split trajectories (default exp.done).
+Needed when done = TRUE termination only (truncation bootstrapped, e.g. DMC): pass lambda e: e.info["is_terminal_step"].
+
+Returns (batch, ix, iy, w, stats): ix, iy index the batch, w = mask / sum(mask) (pair weights summing to 1).
+stats["st_chain_ok"]: fraction of anchors with a newer same-trajectory item whose next_obs equals that item's obs
+(layout check, must be 1.0).
+"""
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+
+def same_traj_batch(buffer_state, key, m: int, G: int, E: int, random_groups: bool = False, n_cross: int = 0,
+                    return_idx: bool = False, boundary=None):
+    assert m % G == 0, "batch size must be a multiple of st_group"
+    n_grp = m // G
+    exp = jax.tree_util.tree_map(lambda x: x[0], buffer_state.experience)   # [L, ...]
+    L = exp.done.shape[0]
+    p = buffer_state.current_index
+    n_valid = jnp.where(buffer_state.is_full, L, p)
+    J = (L + E - 1) // E + 1                                                 # ages 1..J cover the ring
+    envs = jnp.arange(E)
+    tau = jnp.arange(J)                                                      # chrono index, tau = J - age
+    age_of_tau = J - tau                                                     # [J]
+    o_grid = E * age_of_tau[None, :] - envs[:, None]                         # [E, J] offsets back
+    valid = (o_grid >= 1) & (o_grid <= n_valid)
+    pos_grid = jnp.mod(p - o_grid, L)
+    end_flag = exp.done if boundary is None else boundary(exp)       # boundary(exp): episode-end flag incl. truncation
+    done_grid = jnp.where(valid, end_flag[pos_grid].astype(bool), True)
+    di = done_grid.astype(jnp.int32)
+    ep_id = jnp.cumsum(di, axis=1) - di                                      # dones strictly before (chrono)
+
+    k_a, k_p = jax.random.split(key)
+    o_a = jax.random.randint(k_a, (n_grp,), 1, n_valid + 1)                 # uniform over valid items
+    e_a = jnp.mod(-o_a, E)
+    age_a = (o_a + e_a) // E
+    tau_a = J - age_a
+    rows = ep_id[e_a]                                                        # [n_grp, J]
+    id_a = rows[jnp.arange(n_grp), tau_a]
+    start = jnp.sum(rows < id_a[:, None], axis=1)                           # rows are non-decreasing
+    end = jnp.sum(rows <= id_a[:, None], axis=1) - 1
+    ln = end - start + 1                                                     # stored length of the trajectory
+    u = jax.random.randint(k_p, (n_grp, G - 1), 0, jnp.maximum(ln - 1, 1)[:, None])
+    tau_p = start[:, None] + u
+    tau_p = tau_p + (tau_p >= tau_a[:, None]).astype(tau_p.dtype)           # skip the anchor itself
+    tau_p = jnp.where(ln[:, None] >= 2, tau_p, tau_a[:, None])               # singleton: partner = anchor (masked)
+    tau_all = jnp.concatenate([tau_a[:, None], tau_p], axis=1)               # [n_grp, G]
+    o_all = E * (J - tau_all) - e_a[:, None]
+    pos_all = jnp.mod(p - o_all, L)                                          # [n_grp, G]
+    if random_groups:                                                        # partners uniform over the buffer
+        k_r = jax.random.fold_in(k_p, 1)
+        o_r = jax.random.randint(k_r, (n_grp, G - 1), 1, n_valid + 1)
+        pos_all = jnp.concatenate([pos_all[:, :1], jnp.mod(p - o_r, L)], axis=1)
+    idx = pos_all.reshape(-1)
+
+    # ordered pairs of distinct slots inside each group
+    a_, b_ = np.meshgrid(np.arange(G), np.arange(G), indexing="ij")         # static (numpy)
+    off = a_ != b_
+    sa, sb = jnp.asarray(a_[off]), jnp.asarray(b_[off])                      # [G(G-1)]
+    base = (jnp.arange(n_grp) * G)[:, None]
+    ix = (base + sa[None, :]).reshape(-1)
+    iy = (base + sb[None, :]).reshape(-1)
+    mask = (idx[ix] != idx[iy]).astype(jnp.float32)
+    w = mask / jnp.maximum(mask.sum(), 1.0)
+    idx_full = idx
+    ix_st, iy_st = ix, iy
+    if n_cross > 0:
+        k_x = jax.random.fold_in(k_p, 2)
+        o_x = jax.random.randint(k_x, (n_grp, n_cross), 1, n_valid + 1)
+        e_x = jnp.mod(-o_x, E)
+        tau_x = J - (o_x + e_x) // E
+        in_traj = (e_x == e_a[:, None]) & (ep_id[e_x, tau_x] == id_a[:, None])
+        pos_x = jnp.mod(p - o_x, L)
+        idx_full = jnp.concatenate([idx, pos_x.reshape(-1)])
+        a_slot = jnp.repeat(jnp.arange(n_grp) * G, n_cross)
+        x_slot = n_grp * G + jnp.arange(n_grp * n_cross)
+        mx = (~in_traj).reshape(-1).astype(jnp.float32)
+        wx = mx / jnp.maximum(2.0 * mx.sum(), 1.0)                         # both orders together sum to 1
+        ix = jnp.concatenate([ix, a_slot, x_slot]); iy = jnp.concatenate([iy, x_slot, a_slot])
+        w = jnp.concatenate([w, wx, wx])
+    batch = jax.tree_util.tree_map(lambda x: x[idx_full], exp)
+
+    # layout check: next_obs of the anchor == obs of the next (newer) item of the same trajectory
+    has_next = tau_a + 1 <= end
+    o_next = E * (J - jnp.minimum(tau_a + 1, J - 1)) - e_a
+    pos_next = jnp.mod(p - o_next, L)
+    leaf_n = jax.tree_util.tree_leaves(exp.next_obs)[0]
+    leaf_o = jax.tree_util.tree_leaves(exp.obs)[0]
+    same = jnp.all((leaf_n[pos_all[:, 0]] == leaf_o[pos_next]).reshape(n_grp, -1), axis=1)
+    hn = has_next.astype(jnp.float32)
+    stats = {
+        "st_pair_frac": mask.mean(),
+        "st_traj_len": jnp.mean(ln.astype(jnp.float32)),
+        "st_abs_dt": jnp.sum(mask * jnp.abs(tau_all.reshape(-1)[ix_st] - tau_all.reshape(-1)[iy_st]).astype(jnp.float32))
+        / jnp.maximum(mask.sum(), 1.0),
+        "st_chain_ok": jnp.sum(hn * same) / jnp.maximum(hn.sum(), 1.0),
+        "st_chain_n": hn.sum(),
+    }
+    if n_cross > 0:
+        stats["st_cross_in_traj_frac"] = jnp.mean(in_traj.astype(jnp.float32))
+    if return_idx:
+        return batch, ix, iy, w, stats, idx_full
+    return batch, ix, iy, w, stats
+
+
+# ---------------- 2026-11-03: rho-kernel estimators on a grouped batch (no extra items) ----------------
+# Batch from same_traj_batch (n_cross = 0): n_grp groups of G slots, group g = slots [gG, (g+1)G); every slot is
+# marginally uniform over the buffer and slots of different groups are independent.  Target of both estimators:
+#   L_rho = (1 - rho) E_{x~mu, y~mu(.|tau(x)), y != x} l(x, y) + rho E_{x, y ~ mu, y != x} l(x, y)
+# same-trajectory part: all ordered within-group slot pairs whose buffer items differ (self pairs never used);
+# cross part: pairs of slots in DIFFERENT groups (independent mu x mu draws), self pairs (same buffer item) excluded.
+
+def rho_pairs(key, idx, n_grp: int, G: int, K: int, rho: float, ix_s, iy_s, w_s):
+    """Pair list + weights for a pair critic.  idx: [m] buffer positions of the slots; (ix_s, iy_s, w_s) the
+    within-group pairs/weights from same_traj_batch (w_s sums to 1 over valid pairs).  Cross part: every slot is x
+    in K pairs with the slot at the same position of K distinct other groups (group shifts j_k ~ distinct U{1..n_grp-1}).
+    Returns ix, iy, w with sum(w_same) = 1 - rho, sum(w_cross) = rho (if the respective parts are non-empty)."""
+    m = n_grp * G
+    j = 1 + jax.random.choice(key, n_grp - 1, (K,), replace=False)
+    ix_c = jnp.tile(jnp.arange(m), K)
+    iy_c = ((jnp.arange(m)[None, :] + G * j[:, None]) % m).reshape(-1)
+    mc = (idx[ix_c] != idx[iy_c]).astype(jnp.float32)
+    w_c = mc / jnp.maximum(mc.sum(), 1.0)
+    return (jnp.concatenate([ix_s, ix_c]), jnp.concatenate([iy_s, iy_c]),
+            jnp.concatenate([(1.0 - rho) * w_s, rho * w_c]))
+
+
+def rdqn_rho_loss(u, ix_s, iy_s, w_s, G: int, rho: float, idx=None):
+    """RDQN network loss  (1-rho) * 0.25 sum_s w (u_x-u_y)^2  +  rho * 0.25 mean_{cross-group ordered pairs} (u_x-u_y)^2.
+    Cross part in closed form: sum_{all i,j} = 2 m sum (u - ubar)^2, sum_{same group} = 2 G sum_g sum (u - mbar_g)^2,
+    #cross ordered pairs = m (m - G) minus the pairs whose two slots hold the SAME buffer item (they contribute 0 to the
+    numerator and are removed from the denominator, i.e. no self pairs)."""
+    m = u.shape[0]
+    L_same = 0.25 * jnp.sum(w_s * jnp.square(u[ix_s] - u[iy_s]))
+    ug = u.reshape(m // G, G)
+    tot = 2.0 * m * jnp.sum(jnp.square(u - u.mean()))
+    within = 2.0 * G * jnp.sum(jnp.square(ug - ug.mean(1, keepdims=True)))
+    n_cross = m * (m - G)
+    if idx is not None:
+        grp = jnp.arange(m) // G
+        n_cross = n_cross - jnp.sum((idx[:, None] == idx[None, :]) & (grp[:, None] != grp[None, :]))
+    L_cross = 0.25 * (tot - within) / n_cross
+    return (1.0 - rho) * L_same + rho * L_cross, L_same, L_cross
+
+
+def rho_weight_matrix(idx, G: int, rho: float):
+    """[m, m] pair weights for all-pairs heads (CW-Duel): same-group distinct-item pairs share 1 - rho, cross-group
+    distinct-item pairs share rho; pairs of the same buffer item (incl. the diagonal) get 0."""
+    m = idx.shape[0]
+    grp = jnp.arange(m) // G
+    distinct = idx[:, None] != idx[None, :]
+    same = (grp[:, None] == grp[None, :]) & distinct
+    cross = (grp[:, None] != grp[None, :]) & distinct
+    Ws = same.astype(jnp.float32); Wc = cross.astype(jnp.float32)
+    return (1.0 - rho) * Ws / jnp.maximum(Ws.sum(), 1.0) + rho * Wc / jnp.maximum(Wc.sum(), 1.0)
+
+
+def rho_weight_matrix_td(idx, G: int, rho: float, done):
+    """2026-11-09 terminal-decoupled rho (diagnosis of the Breakout survival deficit, mechanisms M1/M2):
+    same as rho_weight_matrix, but every SAME-group pair in which either item is terminal (done) gets weight 0; the
+    weight removed from row i is added to row i's cross-group pairs in proportion to their weights, so every row sum
+    (hence each item's total weight as the x side) and the total (1) are unchanged.  A terminal item thus forms its
+    level estimate kappa_i only from independent (cross-trajectory) partners: removes the v_late * eta_early bias of
+    same-trajectory pairs and the noisy same-trajectory kappa (denominator ~ (1 - gamma)).
+    Returns (W [m, m], removed_total)."""
+    W = rho_weight_matrix(idx, G, rho)
+    m = idx.shape[0]
+    grp = jnp.arange(m) // G
+    same = grp[:, None] == grp[None, :]
+    cross = (~same) & (idx[:, None] != idx[None, :])
+    d = done.astype(bool)
+    rm = same & (d[:, None] | d[None, :])
+    Wrm = jnp.where(rm, W, 0.0)
+    keep = W - Wrm
+    removed_row = Wrm.sum(1)
+    cross_row = jnp.where(cross, keep, 0.0).sum(1)
+    scale = 1.0 + removed_row / jnp.maximum(cross_row, 1e-30)
+    W2 = jnp.where(cross, keep * scale[:, None], keep)
+    return W2, Wrm.sum()

@@ -1,0 +1,1224 @@
+"""Pairwise mean critic for MinAtar (Anakin, single file).  2026-10-31.
+
+D(x, y) approximates Q(x) - Q(y) for state-action pairs x = (s, a), y = (s', a').
+Network (PairNet):
+  phi(s)   = MinAtarTorso(s)                                  (Conv16 3x3 VALID -> Dense128)
+  e(s, a)  = Dense128(relu(Dense128([phi(s), emb(a)])))      (emb: 16-d action embedding)
+  g(ex,ey) = Dense1(relu(Dense128([ex, ey])))
+  head=free : D(x, y) = g(e_x, e_y)                           (R-C51 style, no constraint)
+  head=anti : D(x, y) = g(e_x, e_y) - g(e_y, e_x)            (antisymmetric, D(x, x) = 0)
+Action read-out (actor, target greedy action, evaluation): Borda score(s, a) = mean_{b != a} D((s,a), (s,b)).
+Pairing (system.n_partners = K, default 1): each transition is x in K pairs with K distinct cyclic shifts.
+head=lowrank (2026-10-31): D = f(x)-f(y)+z(x).z'(y)-z(y).z'(x), f=w^T h, z=Z1 h, z'=Z2 h (rank system.pair_rank);
+  Borda read-out in closed form; with system.all_pairs=True all m(m-1) ordered pairs of the batch are used, computed as
+  m x m matrices (one matmul each).  See 02_方法/交叉加权成对critic_算法描述_20261031.
+head=free/anti with system.all_pairs=True (2026-11-01): all m(m-1) ordered pairs with the SAME MLP head, computed by the
+  additive decomposition Dense([ex,ey]) = ex K1 + ey K2 + b (Bahdanau-style): U, V once per transition, then
+  relu(U_i + V_j) . w2 + b2 for every pair (no per-pair matmul); Borda read-out uses the same decomposition.
+head=rc51 (2026-10-31): Relative C51 (R-C51) reproduced from its appendix C on the MinAtar body: (s,a) encoder
+  [phi(s), 48-d action embedding] -> 2 x Dense512; pair head [e_x, e_y] -> 2 x Dense512 -> rc_atoms logits over
+  [-rc_vmax, rc_vmax]; continuation head (BCE, cont_coef); Bellman uniformization with gbar = gamma, four-way stay/go
+  mixture of projected targets; one partner per transition (cyclic shift); greedy actions by Borda score of the mean.
+head=sadqn: same-capacity DQN control, Q(s,a) = Dense1(relu(Dense256(e(s,a)))), standard DQN loss on the same
+encoder (pair head and continuation head not created).
+head=duel_mlp (CW-Duel with an MLP state-pair head, 2026-11-02): D((s,a),(t,b)) = Wg(s,t) + A(s,a) - A(t,b),
+  Wg(s,t) = g(phi(s), phi(t)) - g(phi(t), phi(s)), g = Dense1(relu(Dense128([phi_s, phi_t]))) (antisymmetric MLP);
+  A = centred advantage stream on phi(s).  Pairing: system.n_partners distinct cyclic shifts (not all pairs).
+  Current-state parts of Amax/Bmin ALWAYS from the target network (the online-sg variant diverged on seaquest).
+head=duel (CW-Duel, 2026-11-02): D((s,a),(t,b)) = W(s,t) + A(s,a) - A(t,b) on the STATE features phi only
+  (no (s,a) encoder).  A(s,.) = adv(phi(s)) - mean_c adv(phi(s))_c (centred advantage, Dueling stream);
+  W(s,t) = w(s) - w(t) + z1(s).z2(t) - z2(s).z1(t) (antisymmetric low-rank state-pair head, rank pair_rank;
+  pair_rank=0 -> W = w(s) - w(t), the consistent class Q = w + A).  Same-state differences are A(s,a) - A(s,b),
+  Borda(s,a) = A/(A-1) A(s,a), greedy = argmax A.  Loss: all m(m-1) ordered pairs, cross weighting; the
+  CURRENT-state parts of Amax / Bmin use the online network under stop-gradient (so that for pair_rank=0
+  xi_ij = v_j u_i - v_i u_j exactly, u = DQN TD error), next-state parts and a* = argmax A^-(s') the target network.
+  See 02_方法/CW-Duel_*_20261102.
+head=duel_sa (2026-11-04, CW-Duel with a pairwise (s,a) advantage head): identical to head=duel (same W, same loss,
+  all pairs, rho weights, cur_target) except the advantage: psi(s,a) = (s,a) encoder e(s,a) of the free/anti heads
+  (Dense128(relu(Dense128([phi(s), emb(a)]))), 16-d action embedding), psi_c(s,a) = psi(s,a) - mean_b psi(s,b)
+  (centring in embedding space, every action passed through the encoder once), A(s,a) = w . psi_c(s,a) with a
+  LINEAR read-out w (no bias).  Hence A(s,a) - A(t,b) = w . (psi_c(s,a) - psi_c(t,b)), rows of A sum to 0, and the
+  same-state pairwise matrix delta_ab = w . (psi(s,a) - psi(s,b)) has row mean A(s,a) (= Borda).  A non-linear
+  read-out of the difference would not decompose and would reintroduce the free-head non-identifiability.
+head=qcw (2026-11-04, 'RDQN without c, cross-weighted'): D((s,a),(t,b)) = Q(s,a) - Q(t,b) with a plain DQN head
+  Q(s,.) = Dense_A(phi(s)) (du_adv, NOT centred; w = 0, no state-pair term).  Loss/pairs/targets = head=duel path.
+  Zero set of the cross-weighted residual: u = kappa (1 - g(1-d)) -> Q = Q* - kappa (level only, policy-invariant),
+  unlike the centred RDQN loss without c (u = kappa -> Q*_{r-kappa}).
+Old single-partner description: a batch of m replay transitions; transition i is paired with transition (i + k) mod m, k ~ U{1..m-1}
+(one random shift per update; every pair has two different transitions; each transition is once x and once y).
+
+Bootstrap terms (target network D-, greedy actions a*_x, a*_y at s'_x, s'_y by the target Borda score):
+  M     = D-((s'_x,a*_x), (s'_y,a*_y))      Amax = D-((s'_x,a*_x), y)
+  Bmin  = D-(x, (s'_y,a*_y))                Dst  = D-(x, y)
+Realised Gamma = g(1-d), v = 1 - Gamma.
+
+term=cross (head-free cross weighting, our method).  With k = (1-g)/g:
+  xi = v_y r_x - v_x r_y + W1 M + W2 Amax + W3 Bmin + W4 D(x,y)
+  W1 = k Gx Gy,  W2 = Gx (v_y - k Gy),  W3 = Gy (v_x - k Gx),  W4 = -v_y - Gy (v_x - k Gx)
+  xi is linear in the realised outcomes of two independent transitions, so E[xi | x, y] =
+  vbar_x vbar_y (z(x) - z(y)) with z = e/vbar: its zero set (consistent D) is exactly Q(x) - Q(y), no continuation
+  head.  Pair types (realised): both continue -> xi = (1-g)[r_x - r_y + g M - D];  x ends, y continues ->
+  xi = (1-g) r_x - r_y + g Bmin - D;  both end -> xi = r_x - r_y - D.  Semi-gradient step D += lr * xi/(1-g).
+term=unif (R-C51 Bellman uniformization, mean version, Rao-Blackwellised over stay/go, gbar = g):
+  continuation head p(x) = sigmoid(Dense1(e_x)), BCE on d with coefficient cont_coef (0.33);
+  rho = (1-g)/vhat, vhat = 1 - g(1 - p-(x)) (target-network head), go prob gg = rho (1-d)
+  target = rho_x r_x - rho_y r_y + g[gg_x gg_y M + gg_x(1-gg_y) Amax + (1-gg_x) gg_y Bmin + (1-gg_x)(1-gg_y) Dst]
+  delta = target - D(x,y)
+Loss 0.5 * mean((sg[D + delta] - D)^2)  (semi-gradient; delta = xi/(1-g) for cross).  Adam + global clip,
+hard target sync every target_period updates.  Same MinAtar protocol as ff_rdqn (minatar_base).
+
+Same-trajectory pairs (system.same_traj=True, 2026-11-03; head free/anti, term=cross, plain replay): the batch is
+built by same_traj.same_traj_batch (m/G uniform anchors + G-1 partners each, drawn uniformly from the other stored items
+of the anchor's trajectory, G = system.st_group) and the pairs are all ordered pairs of distinct slots inside a group
+(G-1 partners per item instead of n_partners cyclic shifts), loss = 0.5 * weighted mean over those pairs (same
+cross-weighted residual).
+
+AL / PAL (system.al_mode = al | pal, system.al_alpha, 2026-11-03; alpal.py): per-transition penalty P from the
+target Borda read-out (x (A-1)/A, Q units), cross-weighted residual xi' = xi - alpha (v_y P(x) - v_x P(y)).
+
+rho-kernel (system.pair_rho, same_traj=True, st_cross=0; 2026-11-03): within-group pairs weighted (1-rho) and
+rho_kc cross-group partners per slot weighted rho (same_traj.rho_pairs); no extra items.  head=duel (all pairs,
+2026-11-04): the same split as an [m, m] weight matrix over ALL cross-group pairs (same_traj.rho_weight_matrix).
+
+Counterfactual same-state pairs (2026-11-02; system.crn=True, head free/anti, term=cross, K partners, not all_pairs):
+  every env step also executes b ~ U(A minus {a}) from the same pre-step state (make_step_fn of ff_rdqn;
+  system.cf_coupling = crn: shared random numbers, ind: independent rng keys); the buffer item holds both branches.
+  Nodes: m real transitions (s_i, a_i, r_i, d_i, s'_i) and m counterfactual ones (s_i, b_i, r^b_i, d^b_i, s'^b_i).
+  Loss = 0.5 mean_{8m cross-state pairs among the REAL nodes}(delta^2-form)          (unchanged CW-Pair loss)
+       + same_coef * 0.5 mean_{2m same-state pairs (real_i, cf_i), (cf_i, real_i)}(...)
+  with the same cross-weighted xi (unbiased under ind; under crn the termination of one branch can correlate with
+  the TD error of the other -> known tabular bias, 10-30 design note).  The counterfactual nodes are never paired
+  across states.  Greedy actions at s'^b by the same target Borda read-out.  env_calls = 2 x real steps.
+"""
+import copy
+import json
+import os
+import time
+from typing import Any, Dict
+
+import chex
+import distrax
+import flashbax as fbx
+import flax
+import flax.linen as nn
+import hydra
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+from colorama import Fore, Style
+from omegaconf import DictConfig, OmegaConf
+from stoa import get_final_step_metrics
+
+from stoix.base_types import AnakinExperimentOutput, OffPolicyLearnerState, OnlineAndTarget
+from stoix.evaluator import evaluator_setup, get_distribution_act_fn
+from stoix.systems.q_learning.dqn_types import Transition
+from stoix.systems.q_learning.ff_rdqn import CFTransition, MinAtarTorso, get_warmup_fn, make_step_fn
+from stoix.systems.q_learning.same_traj import same_traj_batch, rho_pairs, rho_weight_matrix, rho_weight_matrix_td, balance_kernel, rho_weight_matrix_sparse, nstep_tail, rho_weight_matrix_tshuffle
+from stoix.systems.q_learning.alpal import al_penalty
+from stoix.utils import make_env as environments
+from stoix.utils.jax_utils import unreplicate_batch_dim
+from stoix.utils.logger import LogEvent, StoixLogger
+from stoix.utils.total_timestep_checker import check_total_timesteps
+from stoix.utils.training import make_learning_rate
+
+
+class PairNet(nn.Module):
+    num_actions: int
+    head: str = "anti"      # anti | free | sadqn | lowrank | rc51
+    hidden: int = 128
+    emb_dim: int = 16
+    rank: int = 32          # lowrank: rank r_b of the antisymmetric interaction
+    additive: bool = False  # free/anti: additive decomposition of the first pair layer (all-pairs + Borda), same function
+    n_atoms: int = 51       # rc51: atoms of the return-difference distribution
+    vmax: float = 20.0      # rc51: support [-vmax, vmax]
+    qcw_center: str = "none"  # 2026-11-09 qcw: "softmax" -> Q - E_{softmax(Q)}[Q] per state
+
+    def setup(self):
+        self.torso = MinAtarTorso()
+        self.aemb = nn.Embed(self.num_actions, self.emb_dim)
+        self.sa1 = nn.Dense(self.hidden)
+        self.sa2 = nn.Dense(self.hidden)
+        self.p1 = nn.Dense(self.hidden)
+        self.p1b = nn.Dense(self.hidden)        # rc51 only (second hidden layer of the pair head)
+        self.p2 = nn.Dense(self.n_atoms if self.head == "rc51" else 1)
+        self.lr_f = nn.Dense(1)                 # lowrank: f = w^T h
+        self.lr_z1 = nn.Dense(self.rank, use_bias=False)
+        self.lr_z2 = nn.Dense(self.rank, use_bias=False)
+        self.q1 = nn.Dense(2 * self.hidden)     # sadqn only: 128*256+256+257 params ~= pair head 256*128+128+129
+        self.q2 = nn.Dense(1)
+        self.cont = nn.Dense(1)
+        self.du_adv = nn.Dense(self.num_actions)  # duel: advantage stream on phi(s)
+        self.du_w = nn.Dense(1)                   # duel: w(s)
+        self.du_wa = nn.Dense(1, use_bias=False)  # duel_sa: linear read-out w of the centred (s,a) embedding
+        if self.rank > 0:
+            self.du_z1 = nn.Dense(self.rank, use_bias=False)
+            self.du_z2 = nn.Dense(self.rank, use_bias=False)
+
+    def phi(self, obs):
+        return self.torso(obs)
+
+    def duel_comp(self, h):
+        """duel components of state features h [..., F]: (w [...], z1 [..., r], z2 [..., r], Ac [..., A])."""
+        if self.head == "qcw":         # 2026-11-04: plain Q head, no centring, no w / W
+            Ac = self.du_adv(h)
+            if self.qcw_center == "softmax":
+                Ac = Ac - jnp.sum(jax.nn.softmax(Ac, -1) * Ac, -1, keepdims=True)
+            elif self.qcw_center == "softmax_sg":     # 2026-11-09: same centring, no gradient through the weights
+                Ac = Ac - jnp.sum(jax.lax.stop_gradient(jax.nn.softmax(Ac, -1)) * Ac, -1, keepdims=True)
+            elif self.qcw_center != "none":
+                raise ValueError(self.qcw_center)
+            z = jnp.zeros(h.shape[:-1] + (0,), h.dtype)
+            return jnp.zeros(h.shape[:-1], h.dtype), z, z, Ac
+        if self.head == "duel_sa":     # 2026-11-04: A(s,a) = w . (psi(s,a) - mean_b psi(s,b))
+            Ac = self.duel_sa_adv(h)
+        else:
+            adv = self.du_adv(h)
+            Ac = adv - adv.mean(-1, keepdims=True)
+        w = self.du_w(h)[..., 0]
+        if self.rank > 0:
+            z1, z2 = self.du_z1(h), self.du_z2(h)
+        else:
+            z1 = z2 = jnp.zeros(h.shape[:-1] + (0,), h.dtype)
+        return w, z1, z2, Ac
+
+    def sa_all(self, h):
+        """(s,a) encodings psi(s, b) for every action b: state features h [..., F] -> [..., A, E]."""
+        nA = self.num_actions
+        a = jnp.broadcast_to(jnp.arange(nA), h.shape[:-1] + (nA,))
+        hb = jnp.broadcast_to(h[..., None, :], h.shape[:-1] + (nA, h.shape[-1]))
+        return self.sa(hb, a)
+
+    def duel_sa_adv(self, h):
+        """duel_sa centred advantage [..., A]: w . (psi(s,a) - mean_b psi(s,b))."""
+        psi = self.sa_all(h)
+        psi_c = psi - psi.mean(-2, keepdims=True)
+        return self.du_wa(psi_c)[..., 0]
+
+    def duel_comp_obs(self, obs):
+        return self.duel_comp(self.torso(obs))
+
+    def dm_comp_obs(self, obs):
+        """duel_mlp components: (phi [..., F], Ac [..., A])."""
+        h = self.torso(obs)
+        adv = self.du_adv(h)
+        return h, adv - adv.mean(-1, keepdims=True)
+
+    def dm_W(self, hx, hy):
+        """antisymmetric MLP state-pair head on state features, elementwise over leading dims."""
+        return self.g(hx, hy) - self.g(hy, hx)
+
+    def dm_D(self, obs_x, a_x, obs_y, a_y):
+        """elementwise D((s,a),(t,b)) for duel_mlp (checks / diagnostics)."""
+        hx, Ax = self.dm_comp_obs(obs_x); hy, Ay = self.dm_comp_obs(obs_y)
+        ax = jnp.take_along_axis(Ax, a_x[..., None], -1)[..., 0]
+        ay = jnp.take_along_axis(Ay, a_y[..., None], -1)[..., 0]
+        return self.dm_W(hx, hy) + ax - ay
+
+    def duel_D(self, obs_x, a_x, obs_y, a_y):
+        """elementwise D((s,a),(t,b)) for batched (s, a), (t, b) (checks / diagnostics)."""
+        wx, z1x, z2x, Ax = self.duel_comp_obs(obs_x); wy, z1y, z2y, Ay = self.duel_comp_obs(obs_y)
+        ax = jnp.take_along_axis(Ax, a_x[..., None], -1)[..., 0]
+        ay = jnp.take_along_axis(Ay, a_y[..., None], -1)[..., 0]
+        return wx - wy + jnp.sum(z1x * z2y, -1) - jnp.sum(z2x * z1y, -1) + ax - ay
+
+    def sa(self, phi, a):
+        h = jnp.concatenate([phi, self.aemb(a)], axis=-1)
+        return self.sa2(nn.relu(self.sa1(h)))
+
+    def g(self, ex, ey):
+        return self.p2(nn.relu(self.p1(jnp.concatenate([ex, ey], axis=-1))))[..., 0]
+
+    def comp(self, e):
+        """lowrank components (f, z, z') of one (s,a) encoding."""
+        return self.lr_f(e)[..., 0], self.lr_z1(e), self.lr_z2(e)
+
+    def rc_logits(self, ex, ey):
+        h = nn.relu(self.p1(jnp.concatenate([ex, ey], axis=-1)))
+        return self.p2(nn.relu(self.p1b(h)))                            # [..., n_atoms]
+
+    def support(self):
+        return jnp.linspace(-self.vmax, self.vmax, self.n_atoms)
+
+    def qval(self, e):
+        return self.q2(nn.relu(self.q1(e)))[..., 0]
+
+    def D(self, ex, ey):
+        if self.head == "sadqn":
+            return self.qval(ex) - self.qval(ey)
+        if self.head == "lowrank":
+            fx, zx, zpx = self.comp(ex); fy, zy, zpy = self.comp(ey)
+            return fx - fy + jnp.sum(zx * zpy, -1) - jnp.sum(zy * zpx, -1)
+        if self.head == "rc51":
+            return jnp.sum(jax.nn.softmax(self.rc_logits(ex, ey), -1) * self.support(), -1)
+        if self.head == "anti":
+            return self.g(ex, ey) - self.g(ey, ex)
+        return self.g(ex, ey)
+
+    def all_e(self, obs):
+        phi = self.phi(obs)                                             # [B, F]
+        B = phi.shape[0]
+        a = jnp.broadcast_to(jnp.arange(self.num_actions), (B, self.num_actions))
+        phib = jnp.broadcast_to(phi[:, None, :], (B, self.num_actions, phi.shape[-1]))
+        return self.sa(phib, a)                                         # [B, A, E]
+
+    def pre(self, e):
+        """Additive decomposition of the first pair layer: Dense([ex, ey]) = ex K1 + ey K2 + b.
+        Returns (U, V) with U = e K1 (x-role), V = e K2 + b (y-role)."""
+        Kb = self.p1.variables["params"]
+        K, b = Kb["kernel"], Kb["bias"]
+        dh = e.shape[-1]
+        return e @ K[:dh], e @ K[dh:] + b
+
+    def g_add(self, U, V):
+        """g for every combination: U [..., n, H], V [..., k, H] -> [..., n, k]."""
+        h = nn.relu(U[..., :, None, :] + V[..., None, :, :])
+        Kb = self.p2.variables["params"]
+        return (h @ Kb["kernel"])[..., 0] + Kb["bias"][0]
+
+    def Dmat(self, ex, ey):
+        """D(ex_i, ey_j) for all i, j (free / anti MLP head, additive form)."""
+        Ux, Vx = self.pre(ex); Uy, Vy = self.pre(ey)
+        G = self.g_add(Ux, Vy)
+        
+        if self.head == "anti":
+            G = G - jnp.swapaxes(self.g_add(Uy, Vx), -1, -2)
+        return G
+
+    def scores_from_e(self, E):
+        if self.additive and self.head in ("free", "anti"):            # same Borda, additive computation
+            A = self.num_actions
+            Dm = self.Dmat(E, E)                                        # [B, A, A]
+            off = 1.0 - jnp.eye(A)
+            return (Dm * off).sum(-1) / (A - 1)
+        if self.head == "sadqn":
+            return self.qval(E)
+        if self.head == "lowrank":                                     # Borda closed form, O(A r) per state
+            A = self.num_actions
+            f, z, zp = self.comp(E)                                     # [B,A], [B,A,r], [B,A,r]
+            Sf = f.sum(-1, keepdims=True); Sz = z.sum(-2, keepdims=True); Szp = zp.sum(-2, keepdims=True)
+            return (A * f - Sf + jnp.sum(z * Szp, -1) - jnp.sum(Sz * zp, -1)) / (A - 1)
+        A = self.num_actions
+        ex = jnp.broadcast_to(E[:, :, None, :], (E.shape[0], A, A, E.shape[-1]))
+        ey = jnp.broadcast_to(E[:, None, :, :], (E.shape[0], A, A, E.shape[-1]))
+        Dm = self.D(ex, ey)                                             # [B, A, A], Dm[a, b] = D((s,a),(s,b))
+        off = 1.0 - jnp.eye(A)
+        return (Dm * off).sum(-1) / (A - 1)
+
+    def scores(self, obs):
+        if self.head in ("duel", "duel_sa", "qcw"):                                         # Borda = A/(A-1) * centred advantage
+            A = self.num_actions
+            return self.duel_comp_obs(obs)[3] * A / (A - 1)
+        if self.head == "duel_mlp":
+            A = self.num_actions
+            return self.dm_comp_obs(obs)[1] * A / (A - 1)
+        return self.scores_from_e(self.all_e(obs))
+
+    def cont_logit(self, e):
+        return self.cont(e)[..., 0]
+
+    def __call__(self, obs):                                            # init: touch the used submodules
+        if self.head in ("duel", "duel_sa", "qcw"):
+            return self.scores(obs)
+        if self.head == "duel_mlp":                                     # touch torso, du_adv, p1, p2
+            h, Ac = self.dm_comp_obs(obs)
+            return Ac * self.num_actions / (self.num_actions - 1) + 0.0 * self.dm_W(h, h)[..., None]
+        E = self.all_e(obs)
+        if self.head == "sadqn":
+            return self.scores_from_e(E)
+        if self.additive:                                               # create p1/p2 before the additive path reads them
+            self.g(E[:, 0], E[:, 0])
+        return self.scores_from_e(E), self.cont_logit(E[:, 0])
+
+
+def make_pair_loss(net, gamma: float, term: str, cont_coef: float, max_abs_reward: float,
+                   return_delta: bool = False, n_partners: int = 1, all_pairs: bool = False, cur_target: bool = False,
+                   use_cf: bool = False, same_coef: float = 1.0, nonterm_only: bool = False,
+                   al_mode: str = "none", al_alpha: float = 0.0, cw_closed: str = "none", st_group: int = 8,
+                   cf_same: bool = False, cf_mixed: bool = True, n_step: int = 1, full_target: bool = False):
+    k = (1.0 - gamma) / gamma
+    gn = gamma ** n_step                                                # 2026-11-09 n-step: per-step discount of the look-ahead
+    kn = (1.0 - gn) / gn
+    assert cw_closed in ("none", "A", "B", "C", "D")
+
+    def closed_cw(A_on, A_n, A_sg, r, d, pmat):
+        """2026-11-09 closed-form CW-rho with separable E1/E2 (see patch_cw_closed.py docstring)."""
+        m = r.shape[0]
+        Qs = jax.lax.stop_gradient(A_on)
+        Gd = gamma * (1.0 - d); v = 1.0 - Gd; T = d; N = 1.0 - d
+        u = jax.lax.stop_gradient(r + Gd * A_n - Qs)
+        gc = jax.lax.stop_gradient(A_sg - Qs) if cur_target else jnp.zeros_like(Qs)
+        w = jax.lax.stop_gradient(pmat + pmat.T)
+        grp = jnp.arange(m) // st_group
+        cross = (grp[:, None] != grp[None, :]).astype(w.dtype)
+        wk = w * cross if cw_closed in ("C", "D") else w
+        om_r = w @ v; nu_r = w @ N
+        if cw_closed in ("B", "D"):
+            om = jnp.full_like(om_r, jnp.mean(om_r)); nu = jnp.full_like(nu_r, jnp.mean(nu_r))
+        else:
+            om, nu = om_r, nu_r
+        den = wk @ v
+        kap = (wk @ u) / den; lam = (wk @ (T * gc)) / den
+        e = (om * (u - v * kap) + gamma * T * gc * nu - gamma * N * om * lam) / (1.0 - gamma)
+        loss = -jnp.sum(jax.lax.stop_gradient(e) * A_on)
+        wr = om_r / jnp.mean(om_r)
+        info = {"q_loss": 0.5 * jnp.mean(jnp.square(e)), "td_std": jnp.std(u), "term_frac": jnp.mean(d),
+                "e_abs": jnp.mean(jnp.abs(e)), "kap_mean": jnp.mean(kap), "kap_std": jnp.std(kap),
+                "om_rel_max": jnp.max(wr), "om_rel_std": jnp.std(wr), "q_tilde_mean": jnp.mean(Qs)}
+        return loss, info
+    if al_mode != "none":
+        assert (al_mode in ("al", "pal") and net.head in ("free", "anti") and term == "cross" and not all_pairs
+                and not use_cf) or (al_mode == "al" and net.head in ("qcw", "duel") and all_pairs and term == "cross"
+                and not use_cf), "AL/PAL: CW-Pair free/anti (K partners / same_traj) or AL for all-pairs qcw/duel"
+    if nonterm_only:   # 2026-11-02 ablation: train only on pairs whose two transitions both did NOT terminate
+        assert net.head in ("free", "anti") and term == "cross" and not all_pairs and not use_cf, \
+            "nonterm_only: implemented for head free/anti, term=cross, K partners, no counterfactual pairs"
+    if use_cf:
+        assert net.head in ("free", "anti") and term == "cross" and not all_pairs, \
+            "counterfactual same-state pairs: implemented for head free/anti, term=cross, K partners only"
+
+    def cross_delta(D_xy, M, Amax, Bmin, rx, ry, dx, dy):
+        """cross-weighted pair residual delta = xi / (1 - g) (same formula as the term=cross branch below)."""
+        Gx, Gy = gamma * (1.0 - dx), gamma * (1.0 - dy)
+        vx, vy = 1.0 - Gx, 1.0 - Gy
+        W1 = k * Gx * Gy; W2 = Gx * (vy - k * Gy); W3 = Gy * (vx - k * Gx); W4 = -vy - Gy * (vx - k * Gx)
+        xi = vy * rx - vx * ry + W1 * M + W2 * Amax + W3 * Bmin + W4 * D_xy
+        return jax.lax.stop_gradient(xi) / (1.0 - gamma)
+
+    def cf_pairs(p, tp, tr, ix, iy):
+        """K cross-state pairs among the m real nodes + 2m same-state (real, counterfactual) pairs."""
+        m = tr.action.shape[0]
+        r_real = jnp.clip(tr.reward, -max_abs_reward, max_abs_reward).astype(jnp.float32)
+        r_cf = jnp.clip(tr.cf_reward, -max_abs_reward, max_abs_reward).astype(jnp.float32)
+        r_all = jnp.concatenate([r_real, r_cf])                                   # [2m]: real nodes, then cf nodes
+        d_all = jnp.concatenate([tr.done, tr.cf_done]).astype(jnp.float32)
+        act2 = jnp.concatenate([tr.action, tr.cf_action.astype(tr.action.dtype)])
+        nxt2 = jax.tree_util.tree_map(lambda a, b: jnp.concatenate([a, b]), tr.next_obs, tr.cf_next_obs)
+        phi_on = ap(p, PairNet.phi, tr.obs); phi_t = ap(tp, PairNet.phi, tr.obs)
+        e_on_all = ap(p, PairNet.sa, jnp.concatenate([phi_on, phi_on]), act2)   # [2m, E]
+        e_t_all = ap(tp, PairNet.sa, jnp.concatenate([phi_t, phi_t]), act2)
+        En = ap(tp, PairNet.all_e, nxt2)                                          # [2m, A, E]
+        a_star = jnp.argmax(ap(tp, PairNet.scores_from_e, En), axis=-1)
+        e_n_all = En[jnp.arange(2 * m), a_star]
+
+        def terms(jx, jy):
+            D_xy = ap(p, PairNet.D, e_on_all[jx], e_on_all[jy])
+            M = ap(tp, PairNet.D, e_n_all[jx], e_n_all[jy])
+            Amax = ap(tp, PairNet.D, e_n_all[jx], e_t_all[jy])
+            Bmin = ap(tp, PairNet.D, e_t_all[jx], e_n_all[jy])
+            delta = cross_delta(D_xy, M, Amax, Bmin, r_all[jx], r_all[jy], d_all[jx], d_all[jy])
+            return D_xy, delta
+
+        D_c, delta_c = terms(ix, iy)                                              # cross-state, real nodes only
+        ar = jnp.arange(m)
+        sx = jnp.concatenate([ar, ar + m]); sy = jnp.concatenate([ar + m, ar])   # (real_i, cf_i), (cf_i, real_i)
+        D_s, delta_s = terms(sx, sy)
+        loss_c = 0.5 * jnp.mean(jnp.square(jax.lax.stop_gradient(D_c + delta_c) - D_c))
+        loss_s = 0.5 * jnp.mean(jnp.square(jax.lax.stop_gradient(D_s + delta_s) - D_s))
+        dx, dy = d_all[ix], d_all[iy]
+        one_term = jnp.clip(dx + dy, 0, 1) * (1 - dx * dy)
+        sq = jnp.square(delta_c)
+        d_r, d_b = d_all[:m], d_all[m:]
+        same_out = jnp.all(jnp.equal(tr.next_obs, tr.cf_next_obs).reshape(m, -1), -1) & (r_real == r_cf) & (d_r == d_b)
+        info = {"q_loss": loss_c, "same_loss": loss_s, "td_std": jnp.std(delta_c), "delta_abs": jnp.mean(jnp.abs(delta_c)),
+                "delta_abs_nn": jnp.sum(jnp.abs(delta_c) * (1 - dx) * (1 - dy)) / jnp.maximum(jnp.sum((1 - dx) * (1 - dy)), 1.0),
+                "delta_abs_oneterm": jnp.sum(jnp.abs(delta_c) * one_term) / jnp.maximum(jnp.sum(one_term), 1.0),
+                "oneterm_pair_frac": jnp.mean(one_term),
+                "oneterm_sq_share": jnp.sum(sq * one_term) / jnp.maximum(jnp.sum(sq), 1e-12),
+                "term_frac": jnp.mean(d_r), "D_abs": jnp.mean(jnp.abs(jax.lax.stop_gradient(D_c))),
+                "same_delta_abs": jnp.mean(jnp.abs(delta_s)),
+                "same_D_abs": jnp.mean(jnp.abs(jax.lax.stop_gradient(D_s))),            # |D((s,a),(s,b))| (action gap scale)
+                "same_antisym": jnp.mean(jnp.abs(jax.lax.stop_gradient(D_s[:m] + D_s[m:]))),
+                "cf_term_frac": jnp.mean(d_b), "same_dd_frac": jnp.mean(jnp.abs(d_r - d_b)),
+                "same_outcome_frac": jnp.mean(same_out.astype(jnp.float32))}           # identical outcome (e.g. sticky)
+        if return_delta:
+            info["_delta"] = delta_c
+            info["_delta_same"] = delta_s
+        return loss_c + same_coef * loss_s, info
+
+    def ap(p, method, *args):
+        return net.apply(p, *args, method=method)
+
+    def qcw_cf_pairs(p, tp, tr, r_real, d_real, pm):
+        """2026-11-09: CW-Q-rho on 2m nodes (real + CRN counterfactual twins), kernel [[pm, cI], [cI, 0]]."""
+        m = r_real.shape[0]
+        r_cf = jnp.clip(tr.cf_reward, -max_abs_reward, max_abs_reward).astype(jnp.float32)
+        d_cf = tr.cf_done.astype(jnp.float32)
+        cat = lambda a, b: jax.tree_util.tree_map(lambda x, y: jnp.concatenate([x, y]), a, b)  # noqa: E731
+        obs2, nxt2 = cat(tr.obs, tr.obs), cat(tr.next_obs, tr.cf_next_obs)
+        act2 = jnp.concatenate([tr.action, tr.cf_action.astype(tr.action.dtype)])
+        r2, d2 = jnp.concatenate([r_real, r_cf]), jnp.concatenate([d_real, d_cf])
+        cI = jnp.eye(m, dtype=pm.dtype) * (same_coef / (2.0 * m))
+        if not cf_mixed:                                                # 2026-11-09: drop twins that differ in termination
+            cI = cI * (d_real == d_cf).astype(pm.dtype)[:, None]
+        P2 = jnp.block([[pm, cI], [cI, jnp.zeros((m, m), pm.dtype)]])
+        loss, info = duel_all_pairs(p, tp, obs2, act2, nxt2, r2, d2, pmat=P2)
+        q_on = jax.lax.stop_gradient(ap(p, PairNet.duel_comp_obs, tr.obs)[3])
+        gap = q_on[jnp.arange(m), tr.action] - q_on[jnp.arange(m), tr.cf_action.astype(tr.action.dtype)]
+        same_out = jnp.all(jnp.equal(tr.next_obs, tr.cf_next_obs).reshape(m, -1), -1) & (r_real == r_cf) & (d_real == d_cf)
+        info = {**info, "cf_term_frac": jnp.mean(d_cf), "same_dd_frac": jnp.mean(jnp.abs(d_real - d_cf)),
+                "same_outcome_frac": jnp.mean(same_out.astype(jnp.float32)), "same_gap_abs": jnp.mean(jnp.abs(gap))}
+        return loss, info
+
+    def pairmat(c1, c2):
+        """D(u_i, u'_j) for all i, j from lowrank components c1 = comp(u), c2 = comp(u')."""
+        f1, z1, zp1 = c1; f2, z2, zp2 = c2
+        return f1[:, None] - f2[None, :] + z1 @ zp2.T - zp1 @ z2.T
+
+    def lowrank_all_pairs(p, tp, r, d, e_on, e_t, e_n):
+        m = r.shape[0]
+        c_on = ap(p, PairNet.comp, e_on); c_t = ap(tp, PairNet.comp, e_t); c_n = ap(tp, PairNet.comp, e_n)
+        Dm = pairmat(c_on, c_on)
+        M, Amx, Bmn = pairmat(c_n, c_n), pairmat(c_n, c_t), pairmat(c_t, c_n)
+        Gx, Gy = (gamma * (1 - d))[:, None], (gamma * (1 - d))[None, :]
+        vx, vy = 1 - Gx, 1 - Gy
+        W1 = k * Gx * Gy; W2 = Gx * (vy - k * Gy); W3 = Gy * (vx - k * Gx); W4 = -vy - Gy * (vx - k * Gx)
+        xi = vy * r[:, None] - vx * r[None, :] + W1 * M + W2 * Amx + W3 * Bmn + W4 * jax.lax.stop_gradient(Dm)
+        delta = jax.lax.stop_gradient(xi) / (1.0 - gamma)
+        mask = 1.0 - jnp.eye(m)
+        npair = m * (m - 1)
+        loss = 0.5 * jnp.sum(mask * jnp.square(jax.lax.stop_gradient(Dm + delta) - Dm)) / npair
+        dx, dy = d[:, None], d[None, :]
+        one_term = mask * jnp.clip(dx + dy, 0, 1) * (1 - dx * dy)
+        nn_ = mask * (1 - dx) * (1 - dy)
+        sq = jnp.square(delta) * mask
+        info = {"q_loss": loss, "td_std": jnp.sqrt(jnp.sum(sq) / npair), "delta_abs": jnp.sum(jnp.abs(delta) * mask) / npair,
+                "delta_abs_nn": jnp.sum(jnp.abs(delta) * nn_) / jnp.maximum(jnp.sum(nn_), 1.0),
+                "delta_abs_oneterm": jnp.sum(jnp.abs(delta) * one_term) / jnp.maximum(jnp.sum(one_term), 1.0),
+                "oneterm_pair_frac": jnp.sum(one_term) / npair,
+                "oneterm_sq_share": jnp.sum(sq * one_term) / jnp.maximum(jnp.sum(sq), 1e-12),
+                "term_frac": jnp.mean(d), "D_abs": jnp.sum(jnp.abs(Dm) * mask) / npair,
+                "skew_abs": jnp.sum(jnp.abs(c_on[1] @ c_on[2].T - c_on[2] @ c_on[1].T) * mask) / npair}
+        if return_delta:
+            info["_delta"] = delta
+        return loss, info
+
+    def wmat(c1, c2):
+        """W(u_i, u'_j) for all i, j from duel components c1 = comp(u), c2 = comp(u')."""
+        w1, z11, z21 = c1[:3]; w2, z12, z22 = c2[:3]
+        return w1[:, None] - w2[None, :] + z11 @ z22.T - z21 @ z12.T
+
+    def duel_all_pairs(p, tp, obs, act, nxt, r, d, pmat=None, g_item=None):
+        """CW-Duel, all m(m-1) ordered pairs.  x = row i, y = column j."""
+        m = r.shape[0]
+        c_on = ap(p, PairNet.duel_comp_obs, obs)                        # online, with gradient
+        c_n = ap(tp, PairNet.duel_comp_obs, nxt)                        # target network at s'
+        a_star = jnp.argmax(c_n[3], -1)                                  # greedy under the target advantage
+        A_on = c_on[3][jnp.arange(m), act]                               # A(s_i, a_i)
+        A_n = c_n[3][jnp.arange(m), a_star]                              # A^-(s'_i, a*_i)
+        if cur_target:                                                  # DIAG 2026-11-02: current-state parts of Amax/Bmin from the target net (as in cwpair_lr)
+            c_sg = ap(tp, PairNet.duel_comp_obs, obs)
+            A_sg = c_sg[3][jnp.arange(m), act]
+        else:
+            c_sg = jax.tree_util.tree_map(jax.lax.stop_gradient, c_on)
+            A_sg = jax.lax.stop_gradient(A_on)
+        al_pen = jnp.zeros_like(r)
+        if al_mode == "al":                                             # 2026-11-09 AL: r - alpha * gap of target net at s
+            c_al = c_sg if cur_target else ap(tp, PairNet.duel_comp_obs, obs)
+            al_pen = jax.lax.stop_gradient(jnp.max(c_al[3], -1) - c_al[3][jnp.arange(m), act])
+            r = r - al_alpha * al_pen
+        if cw_closed != "none":                                         # 2026-11-09 closed-form CW-rho (E1/E2 switches)
+            assert pmat is not None and net.head == "qcw", "cw_closed: qcw head with rho weight matrix only"
+            return closed_cw(A_on, A_n, A_sg, r, d, pmat)
+        Dm = wmat(c_on, c_on) + A_on[:, None] - A_on[None, :]             # D((s_i,a_i),(s_j,a_j))
+        M = wmat(c_n, c_n) + A_n[:, None] - A_n[None, :]                 # D-((s'_i,a*_i),(s'_j,a*_j))
+        Amx = wmat(c_n, c_sg) + A_n[:, None] - A_sg[None, :]             # D((s'_i,a*_i),(s_j,a_j))
+        Bmn = wmat(c_sg, c_n) + A_sg[:, None] - A_n[None, :]             # D((s_i,a_i),(s'_j,a*_j))
+        if g_item is None:
+            Gx, Gy = (gamma * (1 - d))[:, None], (gamma * (1 - d))[None, :]
+            k_, nrm_ = k, 1.0 - gamma
+        else:                                                           # 2026-11-09 n-step: per-item discount Gam_i
+            Gx, Gy = g_item[:, None], g_item[None, :]
+            k_, nrm_ = kn, 1.0 - gn
+        vx, vy = 1 - Gx, 1 - Gy
+        W1 = k_ * Gx * Gy; W2 = Gx * (vy - k_ * Gy); W3 = Gy * (vx - k_ * Gx); W4 = -vy - Gy * (vx - k_ * Gx)
+        Dsg = jax.lax.stop_gradient(Dm)
+        if full_target:                                                 # 2026-11-10: whole target from the target net
+            assert cur_target, "qcw_full_target needs duel_cur_target=True"
+            Dsg = jax.lax.stop_gradient(wmat(c_sg, c_sg) + A_sg[:, None] - A_sg[None, :])
+        xi = vy * r[:, None] - vx * r[None, :] + W1 * M + W2 * Amx + W3 * Bmn + W4 * Dsg
+        delta = jax.lax.stop_gradient(xi) / nrm_
+        mask = 1.0 - jnp.eye(m)
+        npair = m * (m - 1)
+        if pmat is None:
+            loss = 0.5 * jnp.sum(mask * jnp.square(jax.lax.stop_gradient(Dsg + delta) - Dm)) / npair
+        else:       # 2026-11-04 rho-kernel pair weights (same_traj.rho_weight_matrix): sum 1, zero on self pairs
+            loss = 0.5 * jnp.sum(pmat * jnp.square(jax.lax.stop_gradient(Dsg + delta) - Dm))
+        dx, dy = d[:, None], d[None, :]
+        one_term = mask * jnp.clip(dx + dy, 0, 1) * (1 - dx * dy)
+        nn_ = mask * (1 - dx) * (1 - dy)
+        sq = jnp.square(delta) * mask
+        Ac = c_sg[3]
+        Wsg = Dsg - (A_sg[:, None] - A_sg[None, :])
+        info = {"q_loss": loss, "td_std": jnp.sqrt(jnp.sum(sq) / npair), "delta_abs": jnp.sum(jnp.abs(delta) * mask) / npair,
+                "delta_abs_nn": jnp.sum(jnp.abs(delta) * nn_) / jnp.maximum(jnp.sum(nn_), 1.0),
+                "delta_abs_oneterm": jnp.sum(jnp.abs(delta) * one_term) / jnp.maximum(jnp.sum(one_term), 1.0),
+                "oneterm_pair_frac": jnp.sum(one_term) / npair,
+                "oneterm_sq_share": jnp.sum(sq * one_term) / jnp.maximum(jnp.sum(sq), 1e-12),
+                "term_frac": jnp.mean(d), "D_abs": jnp.sum(jnp.abs(Dsg) * mask) / npair,
+                "W_abs": jnp.sum(jnp.abs(Wsg) * mask) / npair,
+                "W_std": jnp.std(c_sg[0]),
+                "skew_abs": jnp.sum(jnp.abs(c_sg[1] @ c_sg[2].T - c_sg[2] @ c_sg[1].T) * mask) / npair,
+                "adv_range": jnp.mean(Ac.max(-1) - Ac.min(-1)),
+                "adv_gap": jnp.mean(jnp.sort(Ac, -1)[:, -1] - jnp.sort(Ac, -1)[:, -2]),
+                "adv_abs": jnp.mean(jnp.abs(Ac)), "al_pen": jnp.mean(al_pen)}
+        if return_delta:
+            info["_delta"] = delta
+        return loss, info
+
+    def mlp_all_pairs(p, tp, r, d, e_on, e_t, e_n):
+        """free / anti MLP head, all m(m-1) ordered pairs, additive decomposition (no per-pair matmul)."""
+        m = r.shape[0]
+        Dm = ap(p, PairNet.Dmat, e_on, e_on)
+        M, Amx, Bmn = ap(tp, PairNet.Dmat, e_n, e_n), ap(tp, PairNet.Dmat, e_n, e_t), ap(tp, PairNet.Dmat, e_t, e_n)
+        Gx, Gy = (gamma * (1 - d))[:, None], (gamma * (1 - d))[None, :]
+        vx, vy = 1 - Gx, 1 - Gy
+        W1 = k * Gx * Gy; W2 = Gx * (vy - k * Gy); W3 = Gy * (vx - k * Gx); W4 = -vy - Gy * (vx - k * Gx)
+        xi = vy * r[:, None] - vx * r[None, :] + W1 * M + W2 * Amx + W3 * Bmn + W4 * jax.lax.stop_gradient(Dm)
+        delta = jax.lax.stop_gradient(xi) / (1.0 - gamma)
+        mask = 1.0 - jnp.eye(m)
+        npair = m * (m - 1)
+        loss = 0.5 * jnp.sum(mask * jnp.square(jax.lax.stop_gradient(Dm + delta) - Dm)) / npair
+        dx, dy = d[:, None], d[None, :]
+        one_term = mask * jnp.clip(dx + dy, 0, 1) * (1 - dx * dy)
+        nn_ = mask * (1 - dx) * (1 - dy)
+        sq = jnp.square(delta) * mask
+        Dsg = jax.lax.stop_gradient(Dm)
+        info = {"q_loss": loss, "td_std": jnp.sqrt(jnp.sum(sq) / npair), "delta_abs": jnp.sum(jnp.abs(delta) * mask) / npair,
+                "delta_abs_nn": jnp.sum(jnp.abs(delta) * nn_) / jnp.maximum(jnp.sum(nn_), 1.0),
+                "delta_abs_oneterm": jnp.sum(jnp.abs(delta) * one_term) / jnp.maximum(jnp.sum(one_term), 1.0),
+                "oneterm_pair_frac": jnp.sum(one_term) / npair,
+                "oneterm_sq_share": jnp.sum(sq * one_term) / jnp.maximum(jnp.sum(sq), 1e-12),
+                "term_frac": jnp.mean(d), "D_abs": jnp.sum(jnp.abs(Dsg) * mask) / npair,
+                "antisym_gap": jnp.sum(jnp.abs(Dsg + Dsg.T) * mask) / npair}
+        if return_delta:
+            info["_delta"] = delta
+        return loss, info
+
+    def rc51_pairs(p, tp, r_all, d_all, e_on_all, e_t_all, e_n_all, ix, iy, pw=None):
+        """R-C51 (mean-preserving Bellman uniformization, four-way stay/go mixture, categorical projection)."""
+        from stoix.systems.q_learning.ff_rdqn import c51_project
+        z = jnp.linspace(-net.vmax, net.vmax, net.n_atoms)
+        rx, ry = r_all[ix], r_all[iy]; dx, dy = d_all[ix], d_all[iy]
+        logit_on = ap(p, PairNet.rc_logits, e_on_all[ix], e_on_all[iy])
+        p_t = jax.nn.sigmoid(ap(tp, PairNet.cont_logit, e_t_all))      # continuation-head estimate of P(done)
+        vhat = 1.0 - gamma * (1.0 - p_t)
+        rho_all = (1.0 - gamma) / vhat
+        rho_x, rho_y = rho_all[ix], rho_all[iy]
+        gx, gy = rho_x * (1 - dx), rho_y * (1 - dy)                     # go probabilities (gbar = gamma)
+        rew = rho_x * rx - rho_y * ry
+        disc = jnp.full_like(rew, gamma)
+        sm = lambda a_, b_: jax.nn.softmax(ap(tp, PairNet.rc_logits, a_, b_), -1)   # noqa: E731
+        ex_g, ex_s = e_n_all[ix], e_t_all[ix]; ey_g, ey_s = e_n_all[iy], e_t_all[iy]
+        tgt = (gx * gy)[:, None] * c51_project(sm(ex_g, ey_g), rew, disc, z) \
+            + (gx * (1 - gy))[:, None] * c51_project(sm(ex_g, ey_s), rew, disc, z) \
+            + ((1 - gx) * gy)[:, None] * c51_project(sm(ex_s, ey_g), rew, disc, z) \
+            + ((1 - gx) * (1 - gy))[:, None] * c51_project(sm(ex_s, ey_s), rew, disc, z)
+        tgt = jax.lax.stop_gradient(tgt)
+        ce_j = -jnp.sum(tgt * jax.nn.log_softmax(logit_on, -1), -1)
+        ce = jnp.mean(ce_j) if pw is None else jnp.sum(pw * ce_j)     # 2026-11-09: rho-kernel pair weights (sum 1)
+        logit_c = ap(p, PairNet.cont_logit, e_on_all)
+        bce = optax.sigmoid_binary_cross_entropy(logit_c, d_all).mean()
+        D_mean = jnp.sum(jax.nn.softmax(logit_on, -1) * z, -1)
+        delta = jax.lax.stop_gradient(jnp.sum(tgt * z, -1) - D_mean)
+        pc = jax.nn.sigmoid(logit_c)
+        info = {"q_loss": ce, "td_std": jnp.std(delta), "delta_abs": jnp.mean(jnp.abs(delta)),
+                "term_frac": jnp.mean(d_all), "D_abs": jnp.mean(jnp.abs(D_mean)), "bce": bce,
+                "p_hat_term": jnp.sum(pc * d_all) / jnp.maximum(d_all.sum(), 1.0),
+                "p_hat_nonterm": jnp.sum(pc * (1 - d_all)) / jnp.maximum((1 - d_all).sum(), 1.0),
+                "mass_at_edges": jnp.mean(tgt[:, 0] + tgt[:, -1])}
+        if return_delta:
+            info["_delta"] = delta
+        return ce + cont_coef * bce, info
+
+    def duel_mlp_pairs(p, tp, obs, act, nxt, r_all, d_all, ix, iy):
+        """CW-Duel with MLP state-pair head, pairs (ix, iy).  Current-state parts of Amax/Bmin: target network."""
+        m = act.shape[0]
+        h_on, Ac_on = ap(p, PairNet.dm_comp_obs, obs)                   # online, with gradient
+        h_t, Ac_t = ap(tp, PairNet.dm_comp_obs, obs)                    # target network at s
+        h_n, Ac_n = ap(tp, PairNet.dm_comp_obs, nxt)                    # target network at s'
+        a_star = jnp.argmax(Ac_n, -1)
+        A_on = Ac_on[jnp.arange(m), act]; A_t = Ac_t[jnp.arange(m), act]; A_n = Ac_n[jnp.arange(m), a_star]
+        D_xy = ap(p, PairNet.dm_W, h_on[ix], h_on[iy]) + A_on[ix] - A_on[iy]
+        M = ap(tp, PairNet.dm_W, h_n[ix], h_n[iy]) + A_n[ix] - A_n[iy]
+        Amax = ap(tp, PairNet.dm_W, h_n[ix], h_t[iy]) + A_n[ix] - A_t[iy]
+        Bmin = ap(tp, PairNet.dm_W, h_t[ix], h_n[iy]) + A_t[ix] - A_n[iy]
+        rx, ry = r_all[ix], r_all[iy]; dx, dy = d_all[ix], d_all[iy]
+        Gx, Gy = gamma * (1.0 - dx), gamma * (1.0 - dy)
+        vx, vy = 1.0 - Gx, 1.0 - Gy
+        W1 = k * Gx * Gy; W2 = Gx * (vy - k * Gy); W3 = Gy * (vx - k * Gx); W4 = -vy - Gy * (vx - k * Gx)
+        xi = vy * rx - vx * ry + W1 * M + W2 * Amax + W3 * Bmin + W4 * D_xy
+        delta = jax.lax.stop_gradient(xi) / (1.0 - gamma)
+        tgt = jax.lax.stop_gradient(D_xy + delta)
+        loss = 0.5 * jnp.mean(jnp.square(tgt - D_xy))
+        one_term = jnp.clip(dx + dy, 0, 1) * (1 - dx * dy)
+        sq = jnp.square(delta)
+        Ac = jax.lax.stop_gradient(Ac_on)
+        info = {"q_loss": loss, "td_std": jnp.std(delta), "delta_abs": jnp.mean(jnp.abs(delta)),
+                "delta_abs_nn": jnp.sum(jnp.abs(delta) * (1 - dx) * (1 - dy)) / jnp.maximum(jnp.sum((1 - dx) * (1 - dy)), 1.0),
+                "delta_abs_oneterm": jnp.sum(jnp.abs(delta) * one_term) / jnp.maximum(jnp.sum(one_term), 1.0),
+                "oneterm_pair_frac": jnp.mean(one_term),
+                "oneterm_sq_share": jnp.sum(sq * one_term) / jnp.maximum(jnp.sum(sq), 1e-12),
+                "term_frac": jnp.mean(d_all), "D_abs": jnp.mean(jnp.abs(jax.lax.stop_gradient(D_xy))),
+                "W_abs": jnp.mean(jnp.abs(jax.lax.stop_gradient(D_xy - (A_on[ix] - A_on[iy])))),
+                "adv_range": jnp.mean(Ac.max(-1) - Ac.min(-1)),
+                "adv_gap": jnp.mean(jnp.sort(Ac, -1)[:, -1] - jnp.sort(Ac, -1)[:, -2]),
+                "adv_abs": jnp.mean(jnp.abs(Ac))}
+        if return_delta:
+            info["_delta"] = delta
+        return loss, info
+
+    def loss_fn(p, tp, tr, shift):
+        """n_partners distinct cyclic shifts: every transition is x in n_partners pairs (unbiased, lower variance)."""
+        m = tr.action.shape[0]
+        K = n_partners
+        shifts = 1 + (shift - 1 + jnp.arange(K) * ((m - 1) // K)) % (m - 1)
+        ix = jnp.tile(jnp.arange(m), K)
+        iy = ((jnp.arange(m)[None, :] + shifts[:, None]) % m).reshape(-1)
+        return compute(p, tp, tr, ix, iy)
+
+    def compute(p, tp, tr, ix, iy=None, pw=None):
+        """pairs (ix[j], iy[j]); with a single argument it is the old interface (ix = perm, x = arange).
+        pw (optional, 2026-11-02): per-pair weights, loss = 0.5 sum_j pw_j (tgt_j - D_j)^2 (K-partner free/anti path only)."""
+        if iy is None:
+            iy = ix; ix = jnp.arange(tr.action.shape[0])
+        if use_cf:
+            return cf_pairs(p, tp, tr, ix, iy)
+        obs, act, nxt = tr.obs, tr.action, tr.next_obs
+        r_all = jnp.clip(tr.reward, -max_abs_reward, max_abs_reward).astype(jnp.float32)
+        d_all = tr.done.astype(jnp.float32)
+        m = act.shape[0]
+        if net.head == "duel_mlp":
+            return duel_mlp_pairs(p, tp, obs, act, nxt, r_all, d_all, ix, iy)
+        if net.head in ("duel", "duel_sa", "qcw"):                                          # CW-Duel: state features only, all pairs
+            assert all_pairs, "head=duel is implemented for system.all_pairs=True only"
+            if cf_same:                                                 # 2026-11-09 same-state (real, CRN counterfactual) pairs
+                assert net.head == "qcw" and pw is not None and pw.ndim == 2, "cf_same: qcw + rho weight matrix"
+                return qcw_cf_pairs(p, tp, tr, r_all, d_all, pw)
+            g_item = tr.info.get("nstep_G", None) if (n_step > 1 and isinstance(tr.info, dict)) else None
+            if n_step > 1:
+                assert g_item is not None and al_mode == "none" and cw_closed == "none", "n_step: qcw/duel rho path only"
+            return duel_all_pairs(p, tp, obs, act, nxt, r_all, d_all,
+                                  pmat=pw if (pw is not None and pw.ndim == 2) else None, g_item=g_item)
+        # per-transition encodings (computed once, gathered per pair)
+        e_on_all = ap(p, PairNet.sa, ap(p, PairNet.phi, obs), act)      # [m, E]
+        e_t_all = ap(tp, PairNet.sa, ap(tp, PairNet.phi, obs), act)
+        En = ap(tp, PairNet.all_e, nxt)                                  # [m, A, E]
+        Bn_t = ap(tp, PairNet.scores_from_e, En)                         # target Borda at s' [m, A]
+        a_star = jnp.argmax(Bn_t, axis=-1)
+        e_n_all = En[jnp.arange(m), a_star]                              # [m, E]
+        info = {}
+        if al_mode != "none":   # per-transition AL/PAL penalty in Q units (Borda = A/(A-1) x centred Q)
+            A_ = net.num_actions
+            Bc_t = ap(tp, PairNet.scores_from_e, ap(tp, PairNet.all_e, obs))
+            pen_all = al_penalty(Bc_t * (A_ - 1) / A_, Bn_t * (A_ - 1) / A_, act, d_all, al_mode)
+        if net.head == "sadqn":                                         # plain DQN on the same encoder
+            q_on = ap(p, PairNet.qval, e_on_all)
+            y = r_all + gamma * (1.0 - d_all) * ap(tp, PairNet.qval, e_n_all)
+            delta = jax.lax.stop_gradient(y - q_on)
+            loss = 0.5 * jnp.mean(jnp.square(delta))
+            info.update({"q_loss": loss, "td_std": jnp.std(delta), "delta_abs": jnp.mean(jnp.abs(delta)),
+                         "term_frac": jnp.mean(d_all), "q_tilde_mean": jnp.mean(q_on),
+                         "D_abs": jnp.mean(jnp.abs(q_on - q_on[jnp.roll(jnp.arange(m), 1)]))})
+            if return_delta:
+                info["_delta"] = delta
+            return 0.5 * jnp.mean(jnp.square(jax.lax.stop_gradient(q_on + delta) - q_on)), info
+        if net.head == "lowrank" and all_pairs:
+            return lowrank_all_pairs(p, tp, r_all, d_all, e_on_all, e_t_all, e_n_all)
+        if net.head in ("free", "anti") and all_pairs:
+            return mlp_all_pairs(p, tp, r_all, d_all, e_on_all, e_t_all, e_n_all)
+        if net.head == "rc51":
+            return rc51_pairs(p, tp, r_all, d_all, e_on_all, e_t_all, e_n_all, ix, iy, pw=pw)
+        e_on, e_t, e_n = e_on_all[ix], e_t_all[ix], e_n_all[ix]
+        e_on_y, e_t_y, e_n_y = e_on_all[iy], e_t_all[iy], e_n_all[iy]
+        D_xy = ap(p, PairNet.D, e_on, e_on_y)
+        M = ap(tp, PairNet.D, e_n, e_n_y)
+        Amax = ap(tp, PairNet.D, e_n, e_t_y)
+        Bmin = ap(tp, PairNet.D, e_t, e_n_y)
+        Dst = ap(tp, PairNet.D, e_t, e_t_y)
+        r, d = r_all[ix], d_all[ix]
+        rx, ry = r, r_all[iy]
+        dy = d_all[iy]
+        Gx, Gy = gamma * (1.0 - d), gamma * (1.0 - dy)
+        vx, vy = 1.0 - Gx, 1.0 - Gy
+        info = {}
+        if term == "cross":
+            W1 = k * Gx * Gy
+            W2 = Gx * (vy - k * Gy)
+            W3 = Gy * (vx - k * Gx)
+            W4 = -vy - Gy * (vx - k * Gx)
+            xi = vy * rx - vx * ry + W1 * M + W2 * Amax + W3 * Bmin + W4 * D_xy
+            if al_mode != "none":                                       # xi' = xi - alpha (v_y P(x) - v_x P(y))
+                xi = xi - al_alpha * (vy * pen_all[ix] - vx * pen_all[iy])
+                info["al_pen"] = jnp.mean(pen_all)
+            delta = jax.lax.stop_gradient(xi) / (1.0 - gamma)
+            aux = 0.0
+        else:
+            p_t = jax.nn.sigmoid(ap(tp, PairNet.cont_logit, e_t_all))
+            vhat = 1.0 - gamma * (1.0 - p_t)
+            rho_all = (1.0 - gamma) / vhat
+            rho, rho_y = rho_all[ix], rho_all[iy]
+            ggx, ggy = rho * (1.0 - d), rho_y * (1.0 - dy)
+            target = rho * rx - rho_y * ry + gamma * (ggx * ggy * M + ggx * (1 - ggy) * Amax
+                                                          + (1 - ggx) * ggy * Bmin + (1 - ggx) * (1 - ggy) * Dst)
+            delta = jax.lax.stop_gradient(target - D_xy)
+            logit = ap(p, PairNet.cont_logit, e_on_all)
+            d = d_all
+            bce = optax.sigmoid_binary_cross_entropy(logit, d).mean()
+            aux = cont_coef * bce
+            pc = jax.nn.sigmoid(logit)
+            nt = jnp.maximum(d.sum(), 1.0)
+            info["p_hat_term"] = (pc * d).sum() / nt
+            info["p_hat_nonterm"] = (pc * (1 - d)).sum() / jnp.maximum((1 - d).sum(), 1.0)
+            info["bce"] = bce
+        tgt = jax.lax.stop_gradient(D_xy + delta)
+        d = d_all[ix]
+        if pw is not None:  # 2026-11-02 variance reduction: cell-weighted (stratified) pair estimator
+            pair_loss = 0.5 * jnp.sum(pw * jnp.square(tgt - D_xy))
+        elif nonterm_only:   # mean over pairs with d_x = d_y = 0; pairs touching a terminal transition get weight 0
+            nn_mask = (1 - d) * (1 - dy)
+            pair_loss = 0.5 * jnp.sum(nn_mask * jnp.square(tgt - D_xy)) / jnp.maximum(jnp.sum(nn_mask), 1.0)
+            info["nn_pair_frac"] = jnp.mean(nn_mask)
+        else:
+            pair_loss = 0.5 * jnp.mean(jnp.square(tgt - D_xy))
+        one_term = jnp.clip(d + dy, 0, 1) * (1 - d * dy)
+        sq = jnp.square(delta)
+        info.update({
+            "q_loss": pair_loss, "td_std": jnp.std(delta), "delta_abs": jnp.mean(jnp.abs(delta)),
+            "delta_abs_nn": jnp.sum(jnp.abs(delta) * (1 - d) * (1 - dy)) / jnp.maximum(jnp.sum((1 - d) * (1 - dy)), 1.0),
+            "delta_abs_oneterm": jnp.sum(jnp.abs(delta) * one_term) / jnp.maximum(jnp.sum(one_term), 1.0),
+            "oneterm_pair_frac": jnp.mean(one_term),
+            "oneterm_sq_share": jnp.sum(sq * one_term) / jnp.maximum(jnp.sum(sq), 1e-12),
+            "term_frac": jnp.mean(d_all), "D_abs": jnp.mean(jnp.abs(D_xy)),
+        })
+        if return_delta:
+            info["_delta"] = delta
+        return pair_loss + aux, info
+
+    return loss_fn, compute
+
+
+# ---------------- 2026-11-02: variance reduction for terminal pairs (unbiased) ----------------
+# Stratum of a replay item = its stored done flag d (0 = continues, 1 = terminal).  The target of the K-partner loss is
+# E_{x,y iid ~ replay} l(x,y) = sum_{h,h'} pi_h pi_h' E[l | x in h, y in h'],  pi_1 = fraction of terminal items in the
+# buffer (counted exactly).  Cell-weighted estimator: every pair of cell (h,h') gets weight pi_h pi_h' / n_(h,h'),
+# n = number of pairs of that cell in the batch (empty cell -> weight 0).  Unbiased for any pair layout in which the two
+# members of a pair are independent draws from their strata, hence it allows
+#   (A) stratified sampling: n_T items drawn from the terminal stratum, m - n_T from the rest (system.strat_term = n_T);
+#   (B) extra partners: every terminal item of the batch gets KT more random partners in both orders (system.term_partners).
+# If the buffer holds no terminal item, pi_1 = 0 and the estimator is the plain mean over pairs.
+
+def strat_sample(exp, valid, key, m: int, n_T: int):
+    """exp: Transition with leaves [L, ...] (flat replay storage), valid: [L] bool.  Returns (batch [m], pi_T)."""
+    d = exp.done.astype(bool) & valid
+    nd = valid & ~d
+    cT, cV = d.sum(), valid.sum()
+    pi_T = cT / jnp.maximum(cV, 1)
+    pT = jnp.where(cT > 0, d, valid).astype(jnp.float32)
+    pN = jnp.where(nd.sum() > 0, nd, valid).astype(jnp.float32)
+    k1, k2, k3 = jax.random.split(key, 3)
+    L = valid.shape[0]
+    iT = jax.random.choice(k1, L, (n_T,), p=pT / pT.sum())
+    iN = jax.random.choice(k2, L, (m - n_T,), p=pN / pN.sum())
+    ids = jax.random.permutation(k3, jnp.concatenate([iT, iN]))
+    return jax.tree_util.tree_map(lambda x: x[ids], exp), pi_T
+
+
+def build_weighted_pairs(key, d, pi_T, K: int, shift, KT: int, n_cap: int, tt: bool = False):
+    """d: [m] done flags of the batch.  Standard K cyclic-shift pairs + (KT>0) extra pairs for up to n_cap terminal
+    items + (tt) a cycle of terminal-terminal pairs among them (used with stratified sampling, so that the (1,1) cell
+    is never empty).  Returns ix, iy, pw (cell weights; they sum to 1 when every cell with pi_h pi_h' > 0 is present)."""
+    m = d.shape[0]
+    d = d.astype(jnp.float32)
+    shifts = 1 + (shift - 1 + jnp.arange(K) * ((m - 1) // K)) % (m - 1)
+    ix = jnp.tile(jnp.arange(m), K)
+    iy = ((jnp.arange(m)[None, :] + shifts[:, None]) % m).reshape(-1)
+    mask = jnp.ones(ix.shape[0])
+    if KT > 0:
+        tpos = jnp.argsort(-d)[:n_cap]                                  # terminal items first
+        tmask = d[tpos]
+        j = (tpos[:, None] + jax.random.randint(key, (n_cap, KT), 1, m)) % m
+        ti = jnp.repeat(tpos, KT); tj = j.reshape(-1); tm = jnp.repeat(tmask, KT)
+        ix = jnp.concatenate([ix, ti, tj]); iy = jnp.concatenate([iy, tj, ti]); mask = jnp.concatenate([mask, tm, tm])
+    if tt:
+        tpos = jnp.argsort(-d)[:n_cap]
+        nxt = jnp.roll(tpos, -1)
+        ix = jnp.concatenate([ix, tpos]); iy = jnp.concatenate([iy, nxt]); mask = jnp.concatenate([mask, d[tpos] * d[nxt]])
+    hx, hy = d[ix].astype(jnp.int32), d[iy].astype(jnp.int32)
+    cell = 2 * hx + hy
+    n_c = jax.ops.segment_sum(mask, cell, num_segments=4)
+    pi = jnp.stack([1.0 - pi_T, pi_T])
+    pw = mask * pi[hx] * pi[hy] / jnp.maximum(n_c[cell], 1.0)
+    pw = jnp.where(n_c[cell] > 0, pw, 0.0)
+    return ix, iy, pw
+
+
+def build_rowcol_pairs(key, d, K: int, shift, KT: int, n_cap: int):
+    """(B) without stratification: uniform batch, the K cyclic-shift pairs + KT extra partners for (up to n_cap)
+    terminal items, weighted as the average of a row estimator and a column estimator:
+      row i  = mean of l(i, j) over i's partners (K standard + KT extra if i is a capped terminal), weight 1/m;
+      col j  = mean of l(i, j) over j's partners as second member (K standard + KT extra), weight 1/m.
+    Partners are other batch positions, i.e. independent replay draws, and the number of partners of a row depends
+    only on that row's own item -> E[row mean | x_i] = E_y l(x_i, y): unbiased with no stratum weights and no empty
+    cells (cell weighting with a uniform batch is biased when a cell is empty, see check_vr.py V3)."""
+    m = d.shape[0]
+    d = d.astype(jnp.float32)
+    shifts = 1 + (shift - 1 + jnp.arange(K) * ((m - 1) // K)) % (m - 1)
+    ix = jnp.tile(jnp.arange(m), K)
+    iy = ((jnp.arange(m)[None, :] + shifts[:, None]) % m).reshape(-1)
+    tpos = jnp.argsort(-d)[:n_cap]
+    ext = jnp.zeros(m).at[tpos].set(d[tpos])                            # 1 for terminal items that get extra partners
+    n_i = K + KT * ext
+    w_std = 0.5 / m * (1.0 / n_i[ix] + 1.0 / n_i[iy])
+    if KT == 0:
+        return ix, iy, w_std
+    k1, k2 = jax.random.split(key)
+    jr = ((tpos[:, None] + jax.random.randint(k1, (n_cap, KT), 1, m)) % m).reshape(-1)
+    jc = ((tpos[:, None] + jax.random.randint(k2, (n_cap, KT), 1, m)) % m).reshape(-1)
+    tr_ = jnp.repeat(tpos, KT); em = jnp.repeat(ext[tpos], KT)
+    w_row = em * 0.5 / (m * n_i[tr_])                                   # extra pair (terminal, random) in the row of tr_
+    w_col = em * 0.5 / (m * n_i[tr_])                                   # extra pair (random, terminal) in the column of tr_
+    return (jnp.concatenate([ix, tr_, jc]), jnp.concatenate([iy, jr, tr_]), jnp.concatenate([w_std, w_row, w_col]))
+
+
+def duel_dqn_loss(net, p, tp, tr, gamma, max_abs_reward):
+    """2026-11-04: DQN TD loss on the head=duel network, Q = w(s) + A(s,a) (+ nothing else for rank 0); target net, no c."""
+    mm = tr.action.shape[0]
+    w, _, _, Ac = net.apply(p, tr.obs, method=PairNet.duel_comp_obs)
+    wn, _, _, Acn = net.apply(tp, tr.next_obs, method=PairNet.duel_comp_obs)
+    q = w + Ac[jnp.arange(mm), tr.action]
+    r = jnp.clip(tr.reward, -max_abs_reward, max_abs_reward).astype(jnp.float32); d = tr.done.astype(jnp.float32)
+    y = jax.lax.stop_gradient(r + gamma * (1.0 - d) * (wn + Acn.max(-1)))
+    return 0.5 * jnp.mean(jnp.square(y - q))
+
+
+def get_learner_fn(env, net, q_apply, q_update_fn, buffer_fns, config):
+    buffer_add_fn, buffer_sample_fn = buffer_fns
+    step = make_step_fn(env, q_apply, config)
+    loss_fn, _ = make_pair_loss(net, float(config.system.gamma), str(config.system.term),
+                                float(config.system.cont_coef), float(config.system.max_abs_reward),
+                                n_partners=int(config.system.get("n_partners", 1)),
+                                all_pairs=bool(config.system.get("all_pairs", False)),
+                                cur_target=bool(config.system.get("duel_cur_target", False)),
+                                full_target=bool(config.system.get("qcw_full_target", False)),
+                                use_cf=bool(config.system.crn) and str(config.system.head) in ("free", "anti"),
+                                same_coef=float(config.system.get("same_coef", 1.0)),
+                                nonterm_only=bool(config.system.get("nonterm_only", False)),
+                                al_mode=str(config.system.get("al_mode", "none")),
+                                al_alpha=float(config.system.get("al_alpha", 0.0)))
+    _, compute_fn = make_pair_loss(net, float(config.system.gamma), str(config.system.term),
+                                   float(config.system.cont_coef), float(config.system.max_abs_reward),
+                                   all_pairs=bool(config.system.get("all_pairs", False)),
+                                   cur_target=bool(config.system.get("duel_cur_target", False)),
+                                full_target=bool(config.system.get("qcw_full_target", False)),
+                                   cw_closed=str(config.system.get("cw_closed", "none")),
+                                   st_group=int(config.system.get("st_group", 8)),
+                                   cf_same=bool(config.system.crn) and str(config.system.head) == "qcw",
+                                   cf_mixed=bool(config.system.get("cf_same_mixed", True)),
+                                   same_coef=float(config.system.get("same_coef", 1.0)),
+                                   al_mode=str(config.system.get("al_mode", "none")),
+                                   al_alpha=float(config.system.get("al_alpha", 0.0)),
+                                   n_step=int(config.system.get("n_step", 1)))
+    n_T = int(config.system.get("strat_term", 0)); KT = int(config.system.get("term_partners", 0))
+    n_cap = int(config.system.get("term_cap", 32)); K = int(config.system.get("n_partners", 1))
+    weighted = n_T > 0 or KT > 0
+    same_traj = bool(config.system.get("same_traj", False)); st_group = int(config.system.get("st_group", 8))
+    pair_rho = config.system.get("pair_rho", None)          # 2026-11-03 rho-kernel with in-batch cross-group partners
+    rho_kc = int(config.system.get("rho_kc", st_group - 1))
+    if pair_rho is not None:
+        pair_rho = float(pair_rho)
+        assert same_traj and int(config.system.get("st_cross", 0)) == 0 and not bool(config.system.get("st_random", False))
+    if same_traj:
+        assert str(config.system.head) in ("free", "anti") and str(config.system.term) == "cross" and not weighted \
+            and not bool(config.system.get("all_pairs", False)) and not bool(config.system.crn) \
+            and not bool(config.system.get("nonterm_only", False)) \
+            or (str(config.system.head) in ("duel", "duel_sa", "qcw") and config.system.get("pair_rho", None) is not None) \
+            or (str(config.system.head) == "rc51" and config.system.get("pair_rho", None) is not None and not weighted
+                and not bool(config.system.get("all_pairs", False)) and not bool(config.system.crn)), \
+            "same_traj: free/anti + cross (or head=duel/qcw or rc51 with pair_rho), plain replay only"
+    if weighted:
+        assert str(config.system.head) in ("free", "anti") and str(config.system.term) == "cross" \
+            and not bool(config.system.get("all_pairs", False)) and not bool(config.system.crn) \
+            and not bool(config.system.get("nonterm_only", False)), "strat_term/term_partners: free/anti + cross + K partners only"
+
+    sw_at = int(config.system.get("dqn_switch_at", -1)); sw_dir = str(config.system.get("dqn_switch_dir", "cw2dqn"))
+    gamma_ = float(config.system.gamma); mar_ = float(config.system.max_abs_reward)
+    if sw_at >= 0:
+        assert str(config.system.head) == "duel" and int(config.system.get("pair_rank", 32)) == 0 and sw_dir in ("cw2dqn", "dqn2cw")
+
+    def dqn_loss(p, tp, tr):
+        return duel_dqn_loss(net, p, tp, tr, gamma_, mar_)
+
+    def wloss(p, tp, tr, ix, iy, pw, t=None):
+        loss, info = compute_fn(p, tp, tr, ix, iy, pw=pw)
+        if sw_at >= 0 and t is not None:     # 2026-11-04 breakout diagnosis: loss switch at env step sw_at
+            l_dqn = dqn_loss(p, tp, tr)
+            after = t >= sw_at
+            use_dqn = after if sw_dir == "cw2dqn" else jnp.logical_not(after)
+            info = {**info, "cw_loss": loss, "dqn_loss": l_dqn, "dqn_active": use_dqn.astype(jnp.float32)}
+            loss = jnp.where(use_dqn, l_dqn, loss)
+        return loss, info
+
+    target_period = int(config.system.target_period)
+    env_steps_per_update = int(config.system.rollout_length) * int(config.arch.num_envs)
+    m = int(config.system.batch_size)
+
+    def _update_step(learner_state, _):
+        def _env_step(learner_state, _):
+            q_params, opt_states, buffer_state, key, env_state, last_timestep = learner_state
+            env_state, timestep, key, tr = step(q_params.online, env_state, last_timestep, key, opt_states["t"])
+            return OffPolicyLearnerState(q_params, opt_states, buffer_state, key, env_state, timestep), tr
+
+        learner_state, traj_batch = jax.lax.scan(_env_step, learner_state, None, config.system.rollout_length)
+        params, opt_states, buffer_state, key, env_state, last_timestep = learner_state
+        buffer_state = buffer_add_fn(buffer_state, traj_batch)
+        opt_states = {**opt_states, "t": opt_states["t"] + env_steps_per_update}
+
+        def _update_epoch(update_state, _):
+            params, opt_states, buffer_state, key = update_state
+            key, sample_key, shift_key = jax.random.split(key, 3)
+            shift = jax.random.randint(shift_key, (), 1, m)
+            if same_traj and pair_rho is not None:
+                sk1, sk2 = jax.random.split(sample_key)
+                transitions, ix, iy, pw, st, idx_ = same_traj_batch(buffer_state, sk1, m, st_group,
+                                                                    int(config.arch.num_envs), return_idx=True)
+                n_step_ = int(config.system.get("n_step", 1))
+                if n_step_ > 1:                                                 # 2026-11-09 n-step tails (same_traj.nstep_tail)
+                    assert str(config.system.head) in ("duel", "qcw"), "n_step: qcw/duel heads only"
+                    R_n, G_n, last_n, nu_n = nstep_tail(buffer_state, idx_, int(config.arch.num_envs), n_step_,
+                                                        float(config.system.gamma), float(config.system.max_abs_reward))
+                    exp_ = jax.tree_util.tree_map(lambda x: x[0], buffer_state.experience)
+                    nxt_n = jax.tree_util.tree_map(lambda x: x[last_n], exp_.next_obs)
+                    info_ = transitions.info if isinstance(transitions.info, dict) else {}
+                    transitions = transitions._replace(reward=R_n, next_obs=nxt_n,
+                                                       done=(G_n == 0.0).astype(transitions.done.dtype),
+                                                       info={**info_, "nstep_G": G_n})
+                    st = {**st, "nstep_used": jnp.mean(nu_n), "nstep_term_frac": jnp.mean((G_n == 0.0).astype(jnp.float32))}
+                if str(config.system.head) in ("duel", "duel_sa", "qcw"):      # all-pairs head: weight matrix instead of a pair list
+                    if bool(config.system.get("rho_term_decouple", False)):    # 2026-11-09 terminal-decoupled rho
+                        pw, td_removed = rho_weight_matrix_td(idx_, st_group, pair_rho, transitions.done)
+                        st = {**st, "td_removed": td_removed}
+                    elif bool(config.system.get("rho_term_shuffle", False)):    # 2026-11-10 E1 causal control
+                        pw, moved_ = rho_weight_matrix_tshuffle(sk2, idx_, st_group, pair_rho, transitions.done)
+                        st = {**st, "tshuf_moved": moved_}
+                    elif int(config.system.get("rho_cross_k", 0)) > 0:          # 2026-11-09 sparse cross partners (K per item)
+                        pw = rho_weight_matrix_sparse(sk2, idx_, st_group, pair_rho, int(config.system.rho_cross_k))
+                        st = {**st, "cross_deg": jnp.mean(jnp.sum((pw > 0) & ((jnp.arange(m) // st_group)[:, None] != (jnp.arange(m) // st_group)[None, :]), 1).astype(jnp.float32))}
+                    else:
+                        pw = rho_weight_matrix(idx_, st_group, pair_rho)
+                    cw_kernel = str(config.system.get("cw_kernel", "none"))     # 2026-11-09 gauge-neutral E1/E2 factorial
+                    if cw_kernel != "none":
+                        v_ = 1.0 - float(config.system.gamma) * (1.0 - transitions.done.astype(jnp.float32))
+                        wA = pw + pw.T
+                        omA = wA @ v_
+                        if cw_kernel == "B2":
+                            pw = balance_kernel(pw, v_, jnp.full_like(omA, jnp.mean(omA)))
+                        elif cw_kernel == "C2":
+                            g_ = jnp.arange(m) // st_group
+                            pc = rho_weight_matrix(idx_, st_group, 1.0) * (g_[:, None] != g_[None, :])
+                            pw = balance_kernel(pc, v_, omA)
+                        else:
+                            raise ValueError(cw_kernel)
+                        wN = pw + pw.T; omN = wN @ v_
+                        st = {**st, "omA_rel_std": jnp.std(omA / jnp.mean(omA)),
+                              "om_rel_std": jnp.std(omN / jnp.mean(omN)),
+                              "om_match": jnp.max(jnp.abs(omN / jnp.mean(omN) - (omA / jnp.mean(omA) if cw_kernel == "C2" else 1.0)))}
+                    ix = iy = jnp.arange(m)
+                else:
+                    ix, iy, pw = rho_pairs(sk2, idx_, m // st_group, st_group, rho_kc, pair_rho, ix, iy, pw)
+                grads, loss_info = jax.grad(wloss, has_aux=True)(params.online, params.target, transitions, ix, iy, pw,
+                                                                 opt_states["t"])
+                loss_info = {**loss_info, **st}
+            elif same_traj:
+                transitions, ix, iy, pw, st = same_traj_batch(buffer_state, sample_key, m, st_group,
+                                                              int(config.arch.num_envs),
+                                                              random_groups=bool(config.system.get("st_random", False)),
+                                                              n_cross=int(config.system.get("st_cross", 0)))
+                grads, loss_info = jax.grad(wloss, has_aux=True)(params.online, params.target, transitions, ix, iy, pw)
+                loss_info = {**loss_info, **st}
+            elif weighted:
+                exp = jax.tree_util.tree_map(lambda x: x[0], buffer_state.experience)
+                L = exp.done.shape[0]
+                valid = buffer_state.is_full | (jnp.arange(L) < buffer_state.current_index)
+                sk1, sk2 = jax.random.split(sample_key)
+                if n_T > 0:     # (A) stratified batch + cell weights (+ extra partners for the terminal slots)
+                    transitions, pi_T = strat_sample(exp, valid, sk1, m, n_T)
+                    ix, iy, pw = build_weighted_pairs(sk2, transitions.done, pi_T, K, shift, KT, min(n_cap, n_T), tt=n_T > 1)
+                else:           # (B) uniform batch + extra partners, row/column weights
+                    transitions = buffer_sample_fn(buffer_state, sk1).experience
+                    pi_T = (exp.done.astype(bool) & valid).sum() / jnp.maximum(valid.sum(), 1)
+                    ix, iy, pw = build_rowcol_pairs(sk2, transitions.done, K, shift, KT, n_cap)
+                grads, loss_info = jax.grad(wloss, has_aux=True)(params.online, params.target, transitions, ix, iy, pw)
+                loss_info = {**loss_info, "pi_T": pi_T, "batch_term_frac": jnp.mean(transitions.done.astype(jnp.float32)),
+                             "pw_term_cells": jnp.sum(pw * jnp.clip(transitions.done[ix].astype(jnp.float32) + transitions.done[iy].astype(jnp.float32), 0, 1))}
+            else:
+                transitions = buffer_sample_fn(buffer_state, sample_key).experience
+                grads, loss_info = jax.grad(loss_fn, has_aux=True)(params.online, params.target, transitions, shift)
+            grads, loss_info = jax.lax.pmean((grads, loss_info), axis_name="batch")
+            grads, loss_info = jax.lax.pmean((grads, loss_info), axis_name="device")
+            upd, q_opt = q_update_fn(grads, opt_states["q"])
+            new_online = optax.apply_updates(params.online, upd)
+            n = opt_states["n"] + 1
+            sync = (n % target_period) == 0
+            new_target = jax.tree_util.tree_map(lambda o, t_: jnp.where(sync, o, t_), new_online, params.target)
+            new_opt = {"q": q_opt, "t": opt_states["t"], "n": n}
+            return (OnlineAndTarget(new_online, new_target), new_opt, buffer_state, key), loss_info
+
+        update_state, loss_info = jax.lax.scan(_update_epoch, (params, opt_states, buffer_state, key), None,
+                                               config.system.epochs)
+        params, opt_states, buffer_state, key = update_state
+        learner_state = OffPolicyLearnerState(params, opt_states, buffer_state, key, env_state, last_timestep)
+        return learner_state, (traj_batch.info, loss_info)
+
+    def learner_fn(learner_state):
+        batched_update_step = jax.vmap(_update_step, in_axes=(0, None), axis_name="batch")
+        learner_state, (episode_info, loss_info) = jax.lax.scan(
+            batched_update_step, learner_state, None, config.arch.num_updates_per_eval)
+        return AnakinExperimentOutput(learner_state=learner_state, episode_metrics=episode_info,
+                                      train_metrics=loss_info)
+
+    return learner_fn
+
+
+def learner_setup(env, keys, config):
+    n_devices = len(jax.devices())
+    A = int(env.action_space().num_values)
+    config.system.action_dim = A
+    key, net_key = keys
+    head = str(config.system.head)
+    net = PairNet(num_actions=A, head=head,
+                  hidden=512 if head == "rc51" else 128, emb_dim=48 if head == "rc51" else 16,
+                  rank=int(config.system.get("pair_rank", 32)), n_atoms=int(config.system.get("rc_atoms", 51)),
+                  vmax=float(config.system.get("rc_vmax", 20.0)),
+                  additive=bool(config.system.get("all_pairs", False)) and head in ("free", "anti"),
+                  qcw_center=str(config.system.get("qcw_center", "none")))
+    train_eps, eval_eps = float(config.system.training_epsilon), float(config.system.evaluation_epsilon)
+    q_apply = lambda p, o: distrax.EpsilonGreedy(  # noqa: E731
+        preferences=net.apply(p, o, method=PairNet.scores), epsilon=train_eps)
+    eval_apply = lambda p, o: distrax.EpsilonGreedy(  # noqa: E731
+        preferences=net.apply(p, o, method=PairNet.scores), epsilon=eval_eps)
+
+    q_lr = make_learning_rate(config.system.q_lr, config, config.system.epochs)
+    q_optim = optax.chain(optax.clip_by_global_norm(config.system.max_grad_norm), optax.adam(q_lr, eps=1e-5))
+    init_x = env.observation_space().generate_value()
+    init_x = jax.tree_util.tree_map(lambda x: x[None, ...], init_x)
+    online = net.init(net_key, init_x)
+    params = OnlineAndTarget(online, online)
+    opt_states = {"q": q_optim.init(online),
+                  "t": jnp.int32(int(config.system.warmup_steps) * int(config.arch.num_envs)), "n": jnp.int32(0)}
+
+    dummy = Transition(
+        obs=jax.tree_util.tree_map(lambda x: x.squeeze(0), init_x), action=jnp.zeros((), dtype=int),
+        reward=jnp.zeros((), dtype=float), done=jnp.zeros((), dtype=bool),
+        next_obs=jax.tree_util.tree_map(lambda x: x.squeeze(0), init_x),
+        info={"episode_return": 0.0, "episode_length": 0, "is_terminal_step": False})
+    if config.system.crn:                                               # counterfactual branch in every item
+        dummy = CFTransition(obs=dummy.obs, action=dummy.action, reward=dummy.reward, done=dummy.done,
+                             next_obs=dummy.next_obs, info=dummy.info, cf_action=jnp.zeros((), dtype=int), cf_reward=jnp.zeros((), dtype=float),
+                             cf_done=jnp.zeros((), dtype=bool),
+                             cf_next_obs=jax.tree_util.tree_map(lambda x: x.squeeze(0), init_x))
+    config.system.buffer_size = config.system.total_buffer_size // (n_devices * config.arch.update_batch_size)
+    config.system.batch_size = config.system.total_batch_size // (n_devices * config.arch.update_batch_size)
+    buffer_fn = fbx.make_item_buffer(max_length=config.system.buffer_size, min_length=config.system.batch_size,
+                                     sample_batch_size=config.system.batch_size, add_batches=True,
+                                     add_sequences=True)
+    buffer_states = buffer_fn.init(dummy)
+
+    learn = get_learner_fn(env, net, q_apply, q_optim.update, (buffer_fn.add, buffer_fn.sample), config)
+    learn = jax.pmap(learn, axis_name="device")
+    warmup = get_warmup_fn(env, params, q_apply, buffer_fn.add, config)
+    warmup = jax.pmap(warmup, axis_name="device")
+
+    key, *env_keys = jax.random.split(key, n_devices * config.arch.update_batch_size * config.arch.num_envs + 1)
+    env_states, timesteps = env.reset(jnp.stack(env_keys))
+    reshape_states = lambda x: x.reshape(  # noqa: E731
+        (n_devices, config.arch.update_batch_size, config.arch.num_envs) + x.shape[1:])
+    env_states = jax.tree_util.tree_map(reshape_states, env_states)
+    timesteps = jax.tree_util.tree_map(reshape_states, timesteps)
+    key, step_key, warmup_key = jax.random.split(key, num=3)
+    step_keys = jax.random.split(step_key, n_devices * config.arch.update_batch_size)
+    warmup_keys = jax.random.split(warmup_key, n_devices * config.arch.update_batch_size)
+    reshape_keys = lambda x: x.reshape((n_devices, config.arch.update_batch_size) + x.shape[1:])  # noqa: E731
+    step_keys, warmup_keys = reshape_keys(jnp.stack(step_keys)), reshape_keys(jnp.stack(warmup_keys))
+    replicate_learner = (params, opt_states, buffer_states)
+    broadcast = lambda x: jnp.broadcast_to(x, (config.arch.update_batch_size,) + x.shape)  # noqa: E731
+    replicate_learner = jax.tree_util.tree_map(broadcast, replicate_learner)
+    replicate_learner = flax.jax_utils.replicate(replicate_learner, devices=jax.devices())
+    params, opt_states, buffer_states = replicate_learner
+    env_states, timesteps, keys, buffer_states = warmup(env_states, timesteps, buffer_states, warmup_keys)
+    init_learner_state = OffPolicyLearnerState(params, opt_states, buffer_states, step_keys, env_states, timesteps)
+    n_params = sum(int(np.prod(x.shape)) for x in jax.tree_util.tree_leaves(online))
+    return learn, eval_apply, init_learner_state, n_params
+
+
+def _mean(x) -> float:
+    return float(np.mean(np.asarray(x)))
+
+
+def run_experiment(_config: DictConfig) -> float:
+    config = copy.deepcopy(_config)
+    n_devices = len(jax.devices())
+    config.num_devices = n_devices
+    config = check_total_timesteps(config)
+    env, eval_env = environments.make(config=config)
+    key, key_e, net_key = jax.random.split(jax.random.PRNGKey(config.arch.seed), num=3)
+    learn, eval_apply, learner_state, n_params = learner_setup(env, (key, net_key), config)
+    evaluator, _, (trained_params, eval_keys) = evaluator_setup(
+        eval_env=eval_env, key_e=key_e, eval_act_fn=get_distribution_act_fn(config, eval_apply),
+        params=learner_state.params.online, config=config)
+    config.arch.num_updates_per_eval = config.arch.num_updates // config.arch.num_evaluation
+    steps_per_rollout = (n_devices * config.arch.num_updates_per_eval * config.system.rollout_length
+                         * config.arch.update_batch_size * config.arch.num_envs)
+    logger = StoixLogger(config)
+    os.makedirs(config.system.run_log_dir, exist_ok=True)
+    algo = str(config.system.get("algo_name") or f"pair_{config.system.head}_{config.system.term}")
+    assert str(config.system.head) in ("anti", "free", "sadqn", "lowrank", "rc51", "duel", "duel_mlp", "duel_sa", "qcw")
+    log_path = os.path.join(config.system.run_log_dir, f"{config.env.scenario.task_name}_{algo}_s{config.arch.seed}.jsonl")
+    flog = open(log_path, "w")
+    flog.write(json.dumps({"config": OmegaConf.to_container(config, resolve=True), "n_params": n_params}) + "\n")
+    print(f"{Fore.YELLOW}{Style.BRIGHT}{algo}  params {n_params}  log -> {log_path}{Style.RESET_ALL}")
+    t0 = time.time()
+    for eval_step in range(config.arch.num_evaluation):
+        start_time = time.time()
+        out = learn(learner_state)
+        jax.block_until_ready(out)
+        elapsed = time.time() - start_time
+        t = int(steps_per_rollout * (eval_step + 1))
+        ep, done_any = get_final_step_metrics(out.episode_metrics)
+        rec = {"timestep": t, "env_calls": t * (2 if config.system.crn else 1), "sps": steps_per_rollout / elapsed}
+        if done_any:
+            rec["train_return"] = _mean(ep["episode_return"]); rec["train_length"] = _mean(ep["episode_length"])
+        rec.update({k: _mean(v) for k, v in out.train_metrics.items()})
+        trained_params = unreplicate_batch_dim(out.learner_state.params.online)
+        key_e, *eval_keys = jax.random.split(key_e, n_devices + 1)
+        eval_keys = jnp.stack(eval_keys).reshape(n_devices, -1)
+        ev = evaluator(trained_params, eval_keys)
+        jax.block_until_ready(ev)
+        rec["eval_return"] = _mean(ev.episode_metrics["episode_return"])
+        rec["eval_length"] = _mean(ev.episode_metrics["episode_length"])
+        rec["wall"] = time.time() - t0
+        logger.log(ev.episode_metrics, t, eval_step, LogEvent.EVAL)
+        flog.write(json.dumps(rec) + "\n"); flog.flush()
+        _ck = config.system.get("ckpt_dir")                # 2026-11-08 checkpoints at 20/40/60/80/100%
+        if _ck and (eval_step + 1) % max(1, config.arch.num_evaluation // 5) == 0:
+            import pickle
+            os.makedirs(_ck, exist_ok=True)
+            with open(os.path.join(_ck, f"{config.env.scenario.task_name}_{algo}_s{config.arch.seed}_t{t}.pkl"), "wb") as _fh:
+                pickle.dump(jax.device_get(trained_params), _fh)
+        learner_state = out.learner_state
+    flog.write(json.dumps({"done": True, "wall": time.time() - t0}) + "\n")
+    flog.close()
+    logger.stop()
+    return float(rec["eval_return"])
+
+
+@hydra.main(config_path="../../configs/default/anakin", config_name="default_ff_rdqn.yaml", version_base="1.2")
+def hydra_entry_point(cfg: DictConfig) -> float:
+    OmegaConf.set_struct(cfg, False)
+    perf = run_experiment(cfg)
+    print(f"{Fore.CYAN}{Style.BRIGHT}pair critic experiment completed{Style.RESET_ALL}")
+    return perf
+
+
+if __name__ == "__main__":
+    hydra_entry_point()

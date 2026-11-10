@@ -1,0 +1,9 @@
+# ---Environment Configs---
+env_name: mujoco_playground
+
+scenario:
+  name: WalkerRun
+  task_name: WalkerRun
+
+kwargs: {}
+eval_metric: episode_return
